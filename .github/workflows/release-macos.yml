@@ -1,0 +1,151 @@
+name: Release macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_id:
+        description: 'Beta release id written to release.json, for example 0.9.0-beta.1'
+        required: false
+        default: '0.9.0-beta.1'
+      display_version:
+        description: 'Human-readable beta version written to release.json'
+        required: false
+        default: '0.9.0 beta 1'
+      release_notes_url:
+        description: 'Public release notes URL written to release.json'
+        required: false
+        default: 'https://videorc.app/releases/0.9.0-beta.1'
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-macos-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  macos:
+    name: Build signed macOS artifact
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.0.9
+          run_install: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.6.0'
+          cache: pnpm
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Check signing and notarization prerequisites
+        run: pnpm release:preflight:macos
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      - name: Check private download storage prerequisites
+        run: pnpm release:upload:preflight:macos
+        env:
+          VIDEORC_DOWNLOAD_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_DOWNLOAD_S3_ACCESS_KEY_ID }}
+          VIDEORC_DOWNLOAD_S3_BUCKET: ${{ secrets.VIDEORC_DOWNLOAD_S3_BUCKET }}
+          VIDEORC_DOWNLOAD_S3_ENDPOINT_URL: ${{ secrets.VIDEORC_DOWNLOAD_S3_ENDPOINT_URL }}
+          VIDEORC_DOWNLOAD_S3_FORCE_PATH_STYLE: ${{ secrets.VIDEORC_DOWNLOAD_S3_FORCE_PATH_STYLE }}
+          VIDEORC_DOWNLOAD_S3_REGION: ${{ secrets.VIDEORC_DOWNLOAD_S3_REGION }}
+          VIDEORC_DOWNLOAD_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_DOWNLOAD_S3_SECRET_ACCESS_KEY }}
+          VIDEORC_DOWNLOAD_S3_SESSION_TOKEN: ${{ secrets.VIDEORC_DOWNLOAD_S3_SESSION_TOKEN }}
+
+      - name: Ensure smoke-test FFmpeg
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            brew install ffmpeg
+          fi
+
+      - name: Verify
+        run: |
+          cargo fmt --check --all
+          pnpm audit:deps
+          pnpm smoke:local-gates
+
+      - name: Build signed and notarized macOS DMG
+        run: pnpm dist:desktop:signed
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          CSC_IDENTITY_AUTO_DISCOVERY: 'true'
+          VIDEORC_RELEASE_ID: ${{ github.event_name == 'workflow_dispatch' && inputs.release_id || '' }}
+          VIDEORC_RELEASE_DISPLAY_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.display_version || '' }}
+          VIDEORC_RELEASE_NOTES_URL: ${{ github.event_name == 'workflow_dispatch' && inputs.release_notes_url || '' }}
+
+      - name: Validate signed macOS artifact
+        run: pnpm release:validate:macos
+
+      - name: Short packaged native-preview performance sentinel
+        run: pnpm smoke:packaged:native-preview:performance
+        env:
+          VIDEORC_PERF_ACTIVE_BUDGET_PATH: config/performance-budgets/v1/active/macos-release.json
+          VIDEORC_PERF_HARDWARE_CLASS: github-hosted-macos-15-arm64-standard
+
+      - name: Upload packaged performance evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: videorc-macos-performance-${{ github.run_id }}
+          path: |
+            docs/acceptance/artifacts/performance/release/packaged-native-preview.json
+            docs/acceptance/artifacts/performance/release/packaged-native-preview.child.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: videorc-macos
+          path: |
+            apps/desktop/release/*.dmg
+            apps/desktop/release/*.dmg.blockmap
+            apps/desktop/release/*.sha256
+            apps/desktop/release/release.json
+          if-no-files-found: error
+
+      - name: Upload beta artifacts to private download storage
+        run: pnpm release:upload:macos
+        env:
+          VIDEORC_DOWNLOAD_S3_ACCESS_KEY_ID: ${{ secrets.VIDEORC_DOWNLOAD_S3_ACCESS_KEY_ID }}
+          VIDEORC_DOWNLOAD_S3_BUCKET: ${{ secrets.VIDEORC_DOWNLOAD_S3_BUCKET }}
+          VIDEORC_DOWNLOAD_S3_ENDPOINT_URL: ${{ secrets.VIDEORC_DOWNLOAD_S3_ENDPOINT_URL }}
+          VIDEORC_DOWNLOAD_S3_FORCE_PATH_STYLE: ${{ secrets.VIDEORC_DOWNLOAD_S3_FORCE_PATH_STYLE }}
+          VIDEORC_DOWNLOAD_S3_REGION: ${{ secrets.VIDEORC_DOWNLOAD_S3_REGION }}
+          VIDEORC_DOWNLOAD_S3_SECRET_ACCESS_KEY: ${{ secrets.VIDEORC_DOWNLOAD_S3_SECRET_ACCESS_KEY }}
+          VIDEORC_DOWNLOAD_S3_SESSION_TOKEN: ${{ secrets.VIDEORC_DOWNLOAD_S3_SESSION_TOKEN }}
+          VIDEORC_RELEASE_UPLOAD_PREFIX: ${{ vars.VIDEORC_RELEASE_UPLOAD_PREFIX }}

@@ -1,0 +1,171 @@
+name: Windows
+
+# Windows counterparts of the fast CI gates plus a downloadable installer.
+# The repo is public, so windows-latest minutes are free. Every failure the
+# first external Windows tester hit (path separators in desktop tests, the
+# stale named-pipe recreate, pnpm spawn semantics, dev-app startup) lived in
+# code that had only ever *compiled* for Windows (pnpm check:windows) and
+# never executed there — these jobs close that gap before a human pulls.
+# Real capture/encode/preview quality still needs the physical Windows box.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gates:
+    name: Windows gates (Rust + JS tests)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.0.9
+          run_install: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.6.0'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Clippy
+        # cfg(windows) code is invisible to the macOS clippy job; this is the
+        # only lint pass that sees the named-pipe/Job-Object/dshow arms. The
+        # unused-code lint family is allowed for now: macOS-only helpers are
+        # dead code under cfg(windows) (the known cross-check warning wall,
+        # docs/windows-port-plan.md) — burn that down, then drop the allows.
+        run: cargo clippy -p videorc-backend -- -D warnings -A dead_code -A unused_imports -A unused_variables -A unused_mut
+
+      - name: Test
+        # Executes the Windows-only unit tests (named pipes, process Job
+        # Objects, dshow input builders) that `pnpm check:windows` can only
+        # compile. ffmpeg-spawning tests are #[ignore]d, same as macOS CI.
+        run: cargo test -p videorc-backend
+
+      - name: Tracked text integrity
+        run: pnpm check:text-files
+
+      - name: Desktop tests
+        run: pnpm --filter @videorc/desktop test
+
+      - name: Node logic tests
+        run: pnpm test:scripts
+
+  installer:
+    name: Windows installer artifact
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11.0.9
+          run_install: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24.6.0'
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Windows installer
+        # Backend release build + pinned LGPL ffmpeg fetch + fail-closed
+        # preflight (runs the ffmpeg rtmps/tls/h264_mf capability probe on a
+        # real Windows host) + electron-builder dir/nsis targets. Unsigned:
+        # testers will see a SmartScreen warning until signing lands.
+        run: pnpm dist:desktop:windows
+
+      - name: Verify bundled FFmpeg live microphone controls
+        run: pnpm probe:live-audio-controls
+        env:
+          VIDEORC_SMOKE_FFMPEG_PATH: ${{ github.workspace }}\apps\desktop\release\win-unpacked\resources\ffmpeg\bin\ffmpeg.exe
+
+      - name: Verify packaged 1080p recording duration and A/V
+        run: pnpm smoke:packaged:bundled
+        env:
+          VIDEORC_PACKAGED_APP_EXECUTABLE: apps/desktop/release/win-unpacked/Videorc.exe
+          VIDEORC_SMOKE_OUTPUT_DIR: ${{ runner.temp }}/videorc-windows-recording-smoke
+          VIDEORC_SMOKE_RECORDING_MS: '5000'
+          VIDEORC_SMOKE_TIMEOUT_MS: '120000'
+          VIDEORC_SMOKE_VIDEO_WIDTH: '1920'
+          VIDEORC_SMOKE_VIDEO_HEIGHT: '1080'
+          VIDEORC_SMOKE_VIDEO_FPS: '30'
+          VIDEORC_SMOKE_VIDEO_BITRATE_KBPS: '6000'
+
+      - name: Verify native DXGI/GDI ScreenOnly recording and BMP preview
+        run: pnpm smoke:windows-native-screen
+        env:
+          VIDEORC_PERF_APP_EXECUTABLE: apps/desktop/release/win-unpacked/Videorc.exe
+          VIDEORC_SMOKE_OUTPUT_DIR: ${{ runner.temp }}/videorc-windows-native-screen-smoke
+          VIDEORC_SMOKE_FFMPEG_PATH: ${{ github.workspace }}\apps\desktop\release\win-unpacked\resources\ffmpeg\bin\ffmpeg.exe
+          VIDEORC_SMOKE_FFPROBE_PATH: ${{ github.workspace }}\apps\desktop\release\win-unpacked\resources\ffmpeg\bin\ffprobe.exe
+          VIDEORC_SMOKE_TIMEOUT_MS: '180000'
+          VIDEORC_WINDOWS_NATIVE_SCREEN_RECORDING_MS: '6000'
+          VIDEORC_SMOKE_VIDEO_WIDTH: '1280'
+          VIDEORC_SMOKE_VIDEO_HEIGHT: '720'
+          VIDEORC_SMOKE_VIDEO_FPS: '30'
+          VIDEORC_SMOKE_VIDEO_BITRATE_KBPS: '4000'
+
+      - name: Verify Windows preview stays live while recording
+        run: pnpm smoke:recording-native-preview
+        env:
+          VIDEORC_PERF_APP_EXECUTABLE: apps/desktop/release/win-unpacked/Videorc.exe
+          VIDEORC_SMOKE_OUTPUT_DIR: ${{ runner.temp }}/videorc-windows-preview-recording-smoke
+          VIDEORC_SMOKE_FFMPEG_PATH: ${{ github.workspace }}\apps\desktop\release\win-unpacked\resources\ffmpeg\bin\ffmpeg.exe
+          VIDEORC_SMOKE_FFPROBE_PATH: ${{ github.workspace }}\apps\desktop\release\win-unpacked\resources\ffmpeg\bin\ffprobe.exe
+          VIDEORC_SMOKE_TIMEOUT_MS: '180000'
+          VIDEORC_NATIVE_PREVIEW_RECORDING_MS: '8000'
+          VIDEORC_NATIVE_PREVIEW_WARMUP_MS: '2000'
+          VIDEORC_NATIVE_PREVIEW_MEASUREMENT_MS: '4000'
+          VIDEORC_EXPECT_NATIVE_METAL_PREVIEW: '0'
+          VIDEORC_NATIVE_PREVIEW_EXERCISE_PROOF_POLLING: '1'
+          # Hosted Windows uses the contained Electron proof surface with 125ms
+          # polling, not the production native CAMetalLayer latency contract.
+          VIDEORC_NATIVE_PREVIEW_MAX_INPUT_TO_PRESENT_P95_MS: '350'
+          VIDEORC_NATIVE_PREVIEW_MAX_INPUT_TO_PRESENT_P99_MS: '500'
+          VIDEORC_ENCODER_BRIDGE_VIDEO_OUTPUT: raw-yuv420p
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: videorc-windows-installer
+          path: |
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.blockmap
+            apps/desktop/release/latest.yml
+          if-no-files-found: error
+          retention-days: 30

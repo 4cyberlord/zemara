@@ -1,0 +1,332 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+
+@custom-variant dark (&:is(.dark *));
+/* The radix-rhea registry components style by orientation through these
+   variants; without them Tailwind matches a literal data-horizontal
+   attribute that radix never sets, and e.g. slider tracks get zero height. */
+@custom-variant data-horizontal (&[data-orientation='horizontal']);
+@custom-variant data-vertical (&[data-orientation='vertical']);
+
+/*
+ * Zemara design tokens — the glass language (.claude/skills/videorc-design).
+ * Two columns of the SAME design: dark is the default and reference
+ * expression, light is its structural twin. Chrome is monochrome glass —
+ * translucent panels over vibrancy, hairline borders at 8%, three text tiers.
+ * Colour carries meaning only: live (red), success, warning, info, and the
+ * vivid source icons. There is no coloured action accent; primary actions are
+ * monochrome text + key chips.
+ *
+ * Token contract — reach for these utilities, not raw values, so every screen
+ * stays consistent:
+ *   Surfaces   bg-background (the ONE translucent coat) · bg-card / bg-popover
+ *              (opaque-92% float for nested popovers/menus). Never stack coats.
+ *   Text tiers text-foreground (primary: titles/labels, weight 500) ·
+ *              text-muted-foreground (secondary: inline context, metadata,
+ *              placeholders) · text-subtle (tertiary: section headers, hints,
+ *              disabled). Three tiers, nothing else.
+ *   Radius     rounded-panel (18px: glass panels, dialogs, palette) ·
+ *              rounded-row (10px: rows, cards) · rounded-chip (6px: key chips,
+ *              small controls). Tiers only — no ad-hoc rounded-xl per screen.
+ *   Hairlines  border (dark white-10% — the polished black-glass edge; light
+ *              black-8%). Never >1px, never solid grey.
+ *   Selection  bg-accent (hover/selected block: white/8% dark · black/6% light,
+ *              no outline) · bg-accent-pressed (white/12% · black/10%).
+ *   Focus      :focus-visible ring is wired in @layer base below.
+ *   Motion     100–150ms ease-out; reduced-motion collapse wired below.
+ *   Colour     only via text/bg live·success·warning·info + vivid source icons.
+ */
+:root {
+  --radius: 0.625rem;
+
+  /* White glass — the porcelain twin of the black-glass column below.
+     White-over-bright reads solid at higher alphas — light mode needs a
+     thinner coat than dark to show at all. */
+  --background: oklch(0.985 0.001 286 / 62%);
+  --foreground: oklch(0.17 0.004 286);
+  --card: oklch(0.99 0 0 / 92%);
+  --card-foreground: oklch(0.17 0.004 286);
+  --popover: oklch(0.99 0 0 / 92%);
+  --popover-foreground: oklch(0.17 0.004 286);
+
+  /* Monochrome action: ink on porcelain. */
+  --primary: oklch(0.17 0.004 286);
+  --primary-foreground: oklch(0.985 0 0);
+
+  --secondary: oklch(0 0 0 / 7%);
+  --secondary-foreground: oklch(0.17 0.004 286);
+  --muted: oklch(0 0 0 / 7%);
+  --muted-foreground: oklch(0.47 0.006 286);
+  /* Hover/selection block: black-6%. */
+  --accent: oklch(0 0 0 / 6%);
+  --accent-foreground: oklch(0.17 0.004 286);
+  /* Pressed block: black-10%. */
+  --accent-pressed: oklch(0 0 0 / 10%);
+  /* Tertiary text tier (section headers, footer hints, disabled). */
+  --subtle: oklch(0.58 0.005 286);
+
+  /* The brand red — the logo's LED-glow eyes (same hue family both themes). */
+  --destructive: oklch(0.55 0.24 27);
+  --destructive-foreground: oklch(0.985 0 0);
+
+  /* Semantic — meaning only, never chrome. */
+  --live: oklch(0.55 0.24 27);
+  --live-foreground: oklch(0.985 0 0);
+  --success: oklch(0.6 0.14 150);
+  --success-foreground: oklch(0.985 0 0);
+  --warning: oklch(0.75 0.15 75);
+  --warning-foreground: oklch(0.27 0.06 75);
+  --info: oklch(0.58 0.14 250);
+  --info-foreground: oklch(0.985 0 0);
+
+  /* Hairlines: black-12% on light — 8% vanished on pale glass over a bright
+     wallpaper (plan 022 Q5 contrast pass). */
+  --border: oklch(0 0 0 / 12%);
+  --input: oklch(0 0 0 / 12%);
+  --ring: oklch(0 0 0 / 25%);
+
+  /* Sidebar is a frosted pane on the glass (backdrop-blur in the aside);
+     selection is the monochrome block. */
+  --sidebar: oklch(0 0 0 / 4%);
+  --sidebar-foreground: oklch(0.17 0.004 286);
+  --sidebar-primary: oklch(0.17 0.004 286);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: oklch(0 0 0 / 6%);
+  --sidebar-accent-foreground: oklch(0.17 0.004 286);
+  --sidebar-border: oklch(0 0 0 / 12%);
+  --sidebar-ring: oklch(0 0 0 / 25%);
+
+  /* Floating glass panel shadow + hairline ring. */
+  --shadow-glass-panel: 0 16px 70px oklch(0 0 0 / 25%), 0 0 0 1px oklch(0 0 0 / 12%);
+
+  /* The wallpaper frost (GlassWallpaperUnderlay img filter). Light keeps the
+     airy porcelain frost. */
+  /* Solid degradation base for when no wallpaper is available (Automation
+     denied): the transparent window must never show other apps through the
+     translucent coat. Matches the porcelain solid (#FAFAFB). */
+  --glass-fallback-base: oklch(0.985 0.001 286);
+  --glass-underlay-filter: blur(70px) saturate(1.4) brightness(1.05);
+  /* A whisper of true translucency. What bleeds through the transparent
+     window is other apps' windows, UNBLURRED (backdrop blur cannot see
+     behind the window), so this is a privacy dial: at the old 0.86, sharp
+     text behind the app was faintly readable through the glass. 0.94 keeps
+     the glass feeling alive without legible bleed — do not lower it. */
+  --glass-underlay-opacity: 0.94;
+
+  /* Glass reflection (the .glass-shine utility): a specular sweep from the
+     upper-left + a bright top rim where light catches the edge. */
+  --glass-shine-rim: inset 0 1px 0 oklch(1 0 0 / 85%);
+  --glass-shine-sweep: linear-gradient(
+    160deg,
+    oklch(1 0 0 / 50%) 0%,
+    oklch(1 0 0 / 18%) 20%,
+    transparent 45%
+  );
+}
+
+.dark {
+  /* Black glass — the reference column, tuned to the logo's glossy black orb:
+     a true-black base (L 0.13 — not #000, which kills the glass depth), chrome
+     text, polished-edge hairlines one step brighter than the classic 8%.
+     Alpha history: 65% read as barely-there, 58% let background text interfere;
+     62% was the charcoal sweet spot — the black base needs 68% or the frost
+     disappears into it. */
+  --background: oklch(0.13 0.003 286 / 68%);
+  --foreground: oklch(0.97 0.001 286);
+  --card: oklch(0.16 0.004 286 / 92%);
+  --card-foreground: oklch(0.97 0.001 286);
+  --popover: oklch(0.16 0.004 286 / 92%);
+  --popover-foreground: oklch(0.97 0.001 286);
+
+  /* Monochrome action: chrome on black. */
+  --primary: oklch(0.97 0.001 286);
+  --primary-foreground: oklch(0.13 0.003 286);
+
+  --secondary: oklch(1 0 0 / 6%);
+  --secondary-foreground: oklch(0.97 0.001 286);
+  --muted: oklch(1 0 0 / 6%);
+  --muted-foreground: oklch(0.71 0.01 286);
+  /* Hover/selection block: white-8%. */
+  --accent: oklch(1 0 0 / 8%);
+  --accent-foreground: oklch(0.97 0.001 286);
+  /* Pressed block: white-12%. */
+  --accent-pressed: oklch(1 0 0 / 12%);
+  --subtle: oklch(0.55 0.008 286);
+
+  /* The brand red — the logo's LED-glow eyes. Red stays semantic (record,
+     live, destructive); it is never chrome. */
+  --destructive: oklch(0.6 0.23 27);
+  --destructive-foreground: oklch(0.985 0 0);
+
+  --live: oklch(0.62 0.24 27);
+  --live-foreground: oklch(0.985 0 0);
+  --success: oklch(0.7 0.15 150);
+  --success-foreground: oklch(0.205 0.04 150);
+  --warning: oklch(0.81 0.15 75);
+  --warning-foreground: oklch(0.25 0.06 75);
+  --info: oklch(0.68 0.14 250);
+  --info-foreground: oklch(0.205 0.04 250);
+
+  /* Hairlines: white-10% — the polished edge of the black glass. */
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 10%);
+  --ring: oklch(1 0 0 / 28%);
+
+  --sidebar: oklch(1 0 0 / 5%);
+  --sidebar-foreground: oklch(0.97 0.001 286);
+  --sidebar-primary: oklch(0.97 0.001 286);
+  --sidebar-primary-foreground: oklch(0.13 0.003 286);
+  --sidebar-accent: oklch(1 0 0 / 8%);
+  --sidebar-accent-foreground: oklch(0.97 0.001 286);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(1 0 0 / 28%);
+
+  --shadow-glass-panel: 0 16px 70px oklch(0 0 0 / 60%), 0 0 0 1px oklch(1 0 0 / 10%);
+
+  /* Solid degradation base for when no wallpaper is available (Automation
+     denied): matches the black-glass solid (#0D0D0F). */
+  --glass-fallback-base: oklch(0.13 0.003 286);
+  /* Black glass: the frost itself goes dark — the wallpaper is dimmed into a
+     smoky texture (the translucent coat alone cannot make a bright wallpaper
+     read black; this can). */
+  --glass-underlay-filter: blur(70px) saturate(1.1) brightness(0.35);
+  /* A whisper of true translucency — see the light-theme note: this is a
+     privacy dial (bleed-through is unblurred); was 0.82, which let text
+     behind the app read through. Do not lower it. */
+  --glass-underlay-opacity: 0.92;
+
+  /* Glass reflection: the orb's specular highlight — subtle white sweep from
+     the upper-left + a glinting top rim on the black glass. */
+  --glass-shine-rim: inset 0 1px 0 oklch(1 0 0 / 14%);
+  --glass-shine-sweep: linear-gradient(
+    160deg,
+    oklch(1 0 0 / 7%) 0%,
+    oklch(1 0 0 / 2.5%) 22%,
+    transparent 45%
+  );
+}
+
+@theme inline {
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-3xl: calc(var(--radius) + 14px);
+  --radius-4xl: calc(var(--radius) + 20px);
+
+  /* Semantic radius tiers — the design language's panel/row/chip vocabulary.
+     Use rounded-panel / rounded-row / rounded-chip at call sites. */
+  --radius-panel: calc(var(--radius) + 8px); /* 18px */
+  --radius-row: var(--radius); /* 10px */
+  --radius-chip: calc(var(--radius) - 4px); /* 6px */
+
+  /* The reference font: the platform system stack (SF Pro / SF Mono on macOS). */
+  --font-sans: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
+  --font-heading:
+    -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', system-ui, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, monospace;
+
+  /* One soft elevation token for menus/dialogs/popovers (borders do the rest). */
+  --shadow-soft: 0 1px 2px oklch(0 0 0 / 0.05), 0 10px 30px oklch(0 0 0 / 0.08);
+  /* Floating glass panel: layered drop + hairline ring (per-theme value above). */
+  --shadow-glass: var(--shadow-glass-panel);
+
+  --color-subtle: var(--subtle);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-info-foreground: var(--info-foreground);
+  --color-info: var(--info);
+  --color-live-foreground: var(--live-foreground);
+  --color-live: var(--live);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-destructive: var(--destructive);
+  --color-success-foreground: var(--success-foreground);
+  --color-success: var(--success);
+  --color-warning-foreground: var(--warning-foreground);
+  --color-warning: var(--warning);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent-pressed: var(--accent-pressed);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+}
+
+@layer components {
+  /* Scoped strictly to while the video player dialog is open (VideoPlayerDialog
+     stamps this attribute on <body>) — normal scrollbar the rest of the time.
+     Scroll stays fully functional (wheel/trackpad/keyboard); only the visible
+     track/thumb is suppressed. Needed because macOS's overlay scrollbar paints
+     in its own compositing layer above regular content: it isn't subject to
+     normal z-index stacking, so it visibly bleeds through the player dialog's
+     translucent backdrop even though Radix's scroll-lock already blocks the
+     underlying page from actually scrolling. */
+  body[data-video-player-open='true'] .app-scroll-region {
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  body[data-video-player-open='true'] .app-scroll-region::-webkit-scrollbar {
+    display: none;
+  }
+
+  /* Glass reflection overlay — apply to any glass surface (window frame,
+     panels, dialogs). Token-driven per theme; pure chrome, no color. */
+  .glass-shine {
+    position: relative;
+  }
+  .glass-shine::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+    background: var(--glass-shine-sweep);
+    box-shadow: var(--glass-shine-rim);
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+  /* Visible keyboard focus for any interactive element that doesn't set its own ring. */
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-ring/70;
+  }
+  /* Honour reduced-motion: collapse transitions/animations, keep behaviour. */
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    ::before,
+    ::after {
+      animation-duration: 0.01ms !important;
+      animation-iteration-count: 1 !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}

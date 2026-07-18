@@ -1,0 +1,10 @@
+{
+  "type": "rtmp_common",
+  "settings": {
+    "bwtest": false,
+    "key": "fixture-not-a-real-key",
+    "protocol": "RTMPS",
+    "server": "rtmps://a.rtmps.youtube.com:443/live2",
+    "service": "YouTube - RTMPS"
+  }
+}

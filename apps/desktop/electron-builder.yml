@@ -1,0 +1,125 @@
+appId: dev.theorcdev.videorc
+productName: Zemara
+artifactName: ${productName}-${version}-${os}-${arch}.${ext}
+asar: true
+npmRebuild: false
+# Auto-update + download channel feed (baked into the app's app-update.yml).
+# Release artifacts (dmg/zip/latest-mac.yml/blockmap) are uploaded to Cloudflare
+# R2 and fronted by videorc-web; the app reads updates from this URL. The
+# videorc-web /api/updates/* route is LIVE and 302s to a presigned R2 object
+# (verified: it returns R2 NoSuchKey until the release feed is uploaded).
+#
+# BETA: point at the live Vercel host; videorc.com is only a teaser until launch.
+# Switch to the production domain when we ship.
+# See "plans/planned/2026-06-30 - Zemara Desktop Distribution Channel Plan".
+publish:
+  provider: generic
+  url: https://www.videorc.com/api/updates/
+
+directories:
+  buildResources: build-resources
+  output: release
+
+files:
+  - out/**/*
+  - package.json
+
+# Shared across platforms. Platform-specific resources live under mac:/win:
+# because electron-builder CONCATENATES global + platform extraResources
+# (it does not override) — a global entry with a mac-only path breaks the
+# Windows build and vice versa.
+extraResources:
+  - from: src/renderer/src/assets/zemara-logo.png
+    to: zemara-logo.png
+  - from: src/renderer/src/assets/backgrounds
+    to: background-assets/bundled
+    filter:
+      - '*.webp'
+
+mac:
+  category: public.app-category.video
+  extraResources:
+    - from: ../../target/release/videorc-backend
+      to: videorc-backend
+      filter:
+        - videorc-backend
+    - from: ../../target/release/native_preview_host_helper
+      to: native_preview_host_helper
+      filter:
+        - native_preview_host_helper
+    - from: ../../target/release/videorc_native_preview.node
+      to: videorc_native_preview.node
+      filter:
+        - videorc_native_preview.node
+    - from: ../../vendor/ffmpeg/current
+      to: ffmpeg
+      filter:
+        - bin/ffmpeg
+        - bin/ffprobe
+        - NOTICE.txt
+        - SOURCE.txt
+        - BUILD-CONFIG.txt
+        - licenses/**/*
+  hardenedRuntime: true
+  icon: build-resources/icon.icns
+  entitlements: build-resources/entitlements.mac.plist
+  entitlementsInherit: build-resources/entitlements.mac.plist
+  # Signed + notarized for Developer ID distribution. The cert is the keychain's
+  # "Developer ID Application: Uros Miric (C2PA37RB58)" — electron-builder
+  # auto-detects it. In electron-builder 26 `notarize` is a boolean; the notary
+  # credentials come from the environment (the `dist:release` script bakes
+  # APPLE_TEAM_ID; you supply the other two):
+  #   APPLE_TEAM_ID                C2PA37RB58 (set by dist:release)
+  #   APPLE_ID                     your Apple ID email
+  #   APPLE_APP_SPECIFIC_PASSWORD  appleid.apple.com -> Sign-In and Security
+  #                                -> App-Specific Passwords
+  # The unsigned `dist`/`package` scripts override this to false.
+  notarize: true
+  extendInfo:
+    NSCameraUsageDescription: Zemara uses the camera for creator overlays when you select a camera source.
+    NSMicrophoneUsageDescription: Zemara uses the microphone when you select a microphone for recording or streaming.
+    NSScreenCaptureDescription: Zemara captures your screen or selected windows only when you start a recording or stream.
+    NSDocumentsFolderUsageDescription: Zemara can save recordings to a folder you choose.
+    NSDownloadsFolderUsageDescription: Zemara can save exports to a folder you choose.
+  # zip is required for macOS auto-update (electron-updater pulls the zip, not the
+  # dmg). dmg = first-time human download; dir = the unpacked .app.
+  target:
+    - dir
+    - dmg
+    - zip
+
+# Windows 11 x64. Unsigned for now (internal testing); Authenticode signing is
+# Phase 5. The .exe backend and the windows-x64 ffmpeg dir override the
+# top-level (macOS) extraResources paths. See docs/windows-port-plan.md.
+#
+# signAndEditExecutable:false skips winCodeSign/rcedit. On Windows without
+# Developer Mode (or admin), extracting winCodeSign fails on unused macOS
+# dylib symlinks ("Cannot create symbolic link : A required privilege is not
+# held by the client"). Safe while we ship unsigned; re-enable for Authenticode
+# / icon resource editing and require Developer Mode or an elevated extract.
+# https://github.com/electron-userland/electron-builder/issues/8149
+win:
+  signAndEditExecutable: false
+  icon: build-resources/icon.ico
+  extraResources:
+    # Host-target build: `pnpm package:backend` on the Windows box puts the
+    # exe in target/release/, not target/<triple>/release/.
+    - from: ../../target/release/videorc-backend.exe
+      to: videorc-backend.exe
+    - from: ../../vendor/ffmpeg/windows-x64
+      to: ffmpeg
+      filter:
+        - bin/ffmpeg.exe
+        # The backend resolves ffprobe as a sibling of the bundled ffmpeg
+        # (ffmpeg.rs); repair/import/probe break without it.
+        - bin/ffprobe.exe
+        - LICENSE.txt
+        - SOURCE.txt
+  target:
+    - dir
+    - nsis
+
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
