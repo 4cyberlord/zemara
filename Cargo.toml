@@ -1,0 +1,24 @@
+[workspace]
+members = ["crates/videorc-backend", "crates/videorc-native-preview-addon"]
+resolver = "3"
+
+# Disable incremental codegen for dev builds. On macOS arm64, stale incremental
+# serde codegen artifacts have produced invalid links for the backend binary.
+[profile.dev]
+incremental = false
+
+# The backend runs real-time per-pixel work (e.g. camera YUV->BGRA conversion at 4K).
+# An unoptimized debug build makes that ~50x slower (hundreds of ms/frame), which
+# starves capture. Optimize the backend crate even in dev so `pnpm dev` behaves like
+# the shipped build; its hot paths are otherwise GPU/hardware so this is cheap at runtime.
+[profile.dev.package.videorc-backend]
+opt-level = 2
+
+[profile.dev.package.videorc-native-preview-addon]
+opt-level = 2
+
+# The per-frame heavy lifting also runs inside dependencies (serde event
+# serialization, objc2/Metal bindings, image encode, tokio); at opt-level 0
+# they multiply dev CPU several-fold. Optimizing them costs one cached rebuild.
+[profile.dev.package."*"]
+opt-level = 2

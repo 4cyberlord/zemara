@@ -1,0 +1,56 @@
+node_modules/
+dist/
+out/
+release/
+.vite/
+.turbo/
+target/
+vendor/ffmpeg/_build/
+vendor/ffmpeg/_src/
+vendor/ffmpeg/current/
+vendor/ffmpeg/macos-*/
+vendor/ffmpeg/windows-x64/
+docs/acceptance/artifacts/
+
+.DS_Store
+*.log
+*.tmp
+
+# Runtime secrets and local credentials — never commit
+.env
+.env.*
+!.env.example
+*.pem
+*.p12
+*.pfx
+*.cer
+*.mobileprovision
+**/videorc-secrets.json
+**/*-secrets.json
+**/credentials.json
+**/credentials/
+**/.credentials/
+
+# Local app databases and caches
+*.sqlite
+*.sqlite3
+*.db
+**/living-text.sqlite3
+
+# Recordings, generated media, and support bundles
+recordings/
+**/recordings/
+support-bundles/
+**/support-bundles/
+*.support-bundle.json
+
+apps/desktop/build/
+apps/desktop/dist/
+
+# Private per-machine agent routing config — never ship
+/CLAUDE.md
+
+# Local IDE/agent state (may reference machine paths or tokens)
+.cursor/
+.claude/
+.agents/

@@ -1,0 +1,5 @@
+node_modules
+target
+vendor
+apps/desktop/out
+apps/desktop/release

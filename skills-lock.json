@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "skills": {
+    "creem": {
+      "source": "https://www.creem.io/SKILL.md",
+      "sourceType": "url",
+      "skillPath": "SKILL.md",
+      "computedHash": "1aaf6dc1b97d8a81e5b32452b2bf7bd146b3fe16f1287b281ed02ae37a6c063b"
+    },
+    "improve": {
+      "source": "shadcn/improve",
+      "sourceType": "github",
+      "skillPath": "skills/improve/SKILL.md",
+      "computedHash": "431adaf38132005b32cacb952313f18b4c03ee98ee4c5859bad323156a48bb02"
+    },
+    "shadcn": {
+      "source": "shadcn/ui",
+      "sourceType": "github",
+      "skillPath": "skills/shadcn/SKILL.md",
+      "computedHash": "80a6226e78f6d1fe464214ae0ef449d49d8ffaa3e7704f011e9b418c678ad4d1"
+    },
+    "shieldcn-badges": {
+      "source": "jal-co/shieldcn",
+      "sourceType": "github",
+      "skillPath": "skills/shieldcn-badges/SKILL.md",
+      "computedHash": "c5d7837d232811929b6976435bcb156355e898c78b6bad8beb26ba97f482e093"
+    }
+  }
+}
