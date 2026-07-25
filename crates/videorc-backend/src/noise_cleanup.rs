@@ -1532,6 +1532,11 @@ fn has_cleanup_space(source_size: u64, available: u64) -> bool {
 }
 
 #[cfg(unix)]
+fn saturating_u64_product(left: impl Into<u64>, right: impl Into<u64>) -> u64 {
+    left.into().saturating_mul(right.into())
+}
+
+#[cfg(unix)]
 fn available_space(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -1542,7 +1547,7 @@ fn available_space(path: &Path) -> Option<u64> {
         return None;
     }
     let stats = unsafe { stats.assume_init() };
-    Some((stats.f_bavail as u64).saturating_mul(stats.f_frsize))
+    Some(saturating_u64_product(stats.f_bavail, stats.f_frsize))
 }
 
 #[cfg(target_os = "windows")]
@@ -1765,6 +1770,7 @@ mod tests {
             },
             layout: default_layout_settings(),
             output: OutputSettings {
+                keep_original_mkv: false,
                 record_enabled: true,
                 stream_enabled: false,
                 output_directory: path.parent().map(|path| path.display().to_string()),
@@ -3043,6 +3049,7 @@ mod tests {
             },
             layout: default_layout_settings(),
             output: OutputSettings {
+                keep_original_mkv: false,
                 record_enabled: true,
                 stream_enabled: false,
                 output_directory: None,

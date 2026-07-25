@@ -1,5 +1,6 @@
 import type {
   AudioSettings,
+  CaptionEnginePreference,
   CaptionStyleId,
   AutomaticSourceFallbackEvent,
   AutomaticSourceFallbackSourceKind,
@@ -28,6 +29,20 @@ export type SettingsState = {
   /** Human-readable picker label only; never a filesystem path. */
   outputDirectory: string
   outputDirectoryHandle?: string
+  /**
+   * Keep the capture MKV (lossless PCM audio) next to the exported MP4
+   * instead of removing it after finalization.
+   */
+  keepOriginalRecording: boolean
+  /**
+   * OS-global shortcuts (work with the app unfocused — a Stream Deck's
+   * native Hotkey action drives these). Electron accelerator syntax.
+   */
+  globalShortcuts?: {
+    recordToggle?: string
+    streamToggle?: string
+    micToggle?: string
+  }
 }
 
 export type CaptionBurnTarget = 'off' | 'stream' | 'recording' | 'both'
@@ -39,6 +54,11 @@ export type CaptionsCaptureSettings = {
   burnTarget: CaptionBurnTarget
   styleId: CaptionStyleId
   language: string
+  /** Speech engine: on-device model (no account), or a network provider
+   *  (Deepgram with deepgramApiKey, otherwise the signed-in gateway). */
+  provider: CaptionEnginePreference
+  /** Operator's own Deepgram key — used only when provider is 'cloud'. */
+  deepgramApiKey: string | null
   styleRevision: number
   position: 'top' | 'bottom'
   textSize: 's' | 'm' | 'l'
@@ -292,7 +312,8 @@ export const STORAGE_KEYS = {
   onboarding: 'videorc.onboardingComplete',
   theme: 'videorc.theme',
   backgroundAssets: 'videorc.backgroundAssets',
-  termsAcceptedVersion: 'videorc.termsAcceptedVersion'
+  termsAcceptedVersion: 'videorc.termsAcceptedVersion',
+  churchSignInSkipped: 'videorc.churchSignInSkipped'
 } as const
 
 // Permissions onboarding: ANY stored value means "seen/dismissed" — the gate
@@ -305,7 +326,8 @@ export const MICROPHONE_SYNC_OFFSET_MAX_MS = 1000
 
 export const defaultSettings: SettingsState = {
   outputDirectory: '',
-  outputDirectoryHandle: undefined
+  outputDirectoryHandle: undefined,
+  keepOriginalRecording: false
 }
 
 export const rtmpDefaults: Record<RtmpPreset, string> = {
@@ -684,6 +706,10 @@ export function defaultCaptionsCaptureSettings(): CaptionsCaptureSettings {
     burnTarget: 'stream',
     styleId: 'classic',
     language: 'auto',
+    // On-device by default: live captions + Bible Verse detection must work
+    // with no account and no API key, exactly like pewbeam out of the box.
+    provider: 'local',
+    deepgramApiKey: null,
     styleRevision: 0,
     position: 'bottom',
     textSize: 'm'
@@ -692,6 +718,7 @@ export function defaultCaptionsCaptureSettings(): CaptionsCaptureSettings {
 
 const CAPTION_BURN_TARGETS: CaptionBurnTarget[] = ['off', 'stream', 'recording', 'both']
 const CAPTION_STYLE_IDS: CaptionStyleId[] = ['classic', 'glass', 'lower-third', 'high-contrast']
+const CAPTION_ENGINE_PREFERENCES: CaptionEnginePreference[] = ['local', 'cloud']
 
 export function normalizeCaptionsCaptureSettings(
   loaded: (Partial<CaptionsCaptureSettings> & { burnInEnabled?: boolean }) | undefined
@@ -729,7 +756,14 @@ export function normalizeCaptionsCaptureSettings(
         : defaults.styleRevision,
     position: loaded?.position === 'top' ? 'top' : defaults.position,
     textSize:
-      loaded?.textSize === 's' || loaded?.textSize === 'l' ? loaded.textSize : defaults.textSize
+      loaded?.textSize === 's' || loaded?.textSize === 'l' ? loaded.textSize : defaults.textSize,
+    provider: CAPTION_ENGINE_PREFERENCES.includes(loaded?.provider as CaptionEnginePreference)
+      ? (loaded?.provider as CaptionEnginePreference)
+      : defaults.provider,
+    deepgramApiKey:
+      typeof loaded?.deepgramApiKey === 'string' && loaded.deepgramApiKey.trim()
+        ? loaded.deepgramApiKey.trim()
+        : null
   }
 }
 

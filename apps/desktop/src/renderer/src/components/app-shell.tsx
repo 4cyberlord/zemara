@@ -1,9 +1,11 @@
-import { ChatCircle } from '@phosphor-icons/react'
+import { ChatCircle, CircleNotch } from '@phosphor-icons/react'
 import { lazy, Suspense, useCallback, useEffect, useRef, useState, type ReactElement } from 'react'
 
 import { AdminBackendProvider } from '@/components/admin-backend-provider'
+import { ChurchSignInGate } from '@/components/church-sign-in-panel'
 import { CommandPalette } from '@/components/command-palette'
 import { FooterActionBar, FooterActionDivider } from '@/components/footer-action-bar'
+import { GateSurface } from '@/components/gate-surface'
 import { Sidebar } from '@/components/sidebar'
 import { Button } from '@/components/ui/button'
 import { Kbd, KbdGroup } from '@/components/ui/kbd'
@@ -19,19 +21,17 @@ import {
   type StudioPanel,
   type WorkspaceTab
 } from '@/components/workspace-nav'
-import { TermsAgreementDialog, TERMS_VERSION } from '@/components/terms-agreement-dialog'
-import { WhatsNewDialog } from '@/components/whats-new-dialog'
-import { useStudioAudio, useStudioCore, useStudioShell } from '@/hooks/use-studio'
+import { TermsAgreementPanel, TERMS_VERSION } from '@/components/terms-agreement-dialog'
+import { WhatsNewDialog, WhatsNewPanel } from '@/components/whats-new-dialog'
+import { useStudioCore, useStudioShell } from '@/hooks/use-studio'
+import { StudioMicVisualProvider } from '@/hooks/use-studio-mic-visual'
 import { useWhatsNew } from '@/hooks/use-whats-new'
 import { ONBOARDING_DISMISSED_VALUE, STORAGE_KEYS } from '@/lib/capture'
 import { WHATS_NEW_STORAGE_KEY } from '@/lib/whats-new'
 import { displayKeyGlyph } from '@/lib/platform'
 import { isActiveRecordingState } from '@/lib/format'
-import {
-  isMediaAccessSnapshotReady,
-  shouldShowPermissionsOnboarding,
-  systemAccessRows
-} from '@/lib/system-access'
+import { isMediaAccessSnapshotReady } from '@/lib/system-access'
+import type { MediaAccessStatus } from '@/lib/backend'
 import { cn } from '@/lib/utils'
 
 // Studio is the launch surface and stays eager. Every other workspace is loaded
@@ -89,6 +89,9 @@ const StreamingTab = lazy(async () => ({
 const PermissionsOnboardingDialog = lazy(async () => ({
   default: (await import('@/components/permissions-onboarding-dialog')).PermissionsOnboardingDialog
 }))
+const PermissionsOnboardingPanel = lazy(async () => ({
+  default: (await import('@/components/permissions-onboarding-dialog')).PermissionsOnboardingPanel
+}))
 
 function WorkspaceTabFallback(): ReactElement {
   return (
@@ -102,57 +105,60 @@ function WorkspaceTabFallback(): ReactElement {
   )
 }
 
-function PermissionsOnboardingGate({
-  open,
-  onOpen,
-  onComplete
-}: {
-  open: boolean
-  onOpen: () => void
-  onComplete: () => void
-}): ReactElement {
-  const { wsStatus, deviceList, mediaAccess, runtimeInfo } = useStudioCore()
-  const { audioMeter } = useStudioAudio()
-  const evaluatedRef = useRef(false)
-  const dialogMountedRef = useRef(open)
-  const backendReady = wsStatus === 'connected' && deviceList.devices.length > 0
-  const mediaAccessReady = runtimeInfo !== null && isMediaAccessSnapshotReady(mediaAccess)
+// First-run permissions step: the LAST gate before the app exists — and the
+// ONLY thing allowed to trigger a permission prompt on first run. The backend
+// is deliberately not started until this gate completes (main defers
+// startBackend to the ungate moment), so rows come straight from macOS TCC:
+// camera/mic via the mediaAccess snapshot IPC, screen via the screen-access
+// preflight IPC. While those snapshots are still arriving it shows a neutral
+// "getting ready" pane (never the app, never a black window).
+function PermissionsFirstRunGate({ onComplete }: { onComplete: () => void }): ReactElement {
+  const { mediaAccess, runtimeInfo } = useStudioCore()
+  const [screenStatus, setScreenStatus] = useState<MediaAccessStatus>('unknown')
 
-  if (open) {
-    dialogMountedRef.current = true
-  }
+  const refreshScreenStatus = useCallback(async (): Promise<void> => {
+    try {
+      const status = await window.videorc.getScreenAccessStatus()
+      setScreenStatus(status)
+    } catch {
+      // Leave the last known status in place; the poll retries.
+    }
+  }, [])
 
   useEffect(() => {
-    if (evaluatedRef.current || !backendReady || !mediaAccessReady) {
-      return
-    }
-    evaluatedRef.current = true
-    const dismissed = localStorage.getItem(STORAGE_KEYS.onboarding) !== null
-    const rows = systemAccessRows({
-      deviceList,
-      audioMeter,
-      platform: runtimeInfo?.platform,
-      mediaAccess
-    })
-    if (shouldShowPermissionsOnboarding({ rows, dismissed, backendReady, mediaAccessReady })) {
-      onOpen()
-    }
-  }, [
-    audioMeter,
-    backendReady,
-    deviceList,
-    mediaAccess,
-    mediaAccessReady,
-    onOpen,
-    runtimeInfo?.platform
-  ])
+    void refreshScreenStatus()
+  }, [refreshScreenStatus])
+
+  const ready =
+    runtimeInfo !== null && isMediaAccessSnapshotReady(mediaAccess) && screenStatus !== 'unknown'
 
   return (
-    <Suspense fallback={null}>
-      {dialogMountedRef.current ? (
-        <PermissionsOnboardingDialog open={open} onComplete={onComplete} />
-      ) : null}
-    </Suspense>
+    <GateSurface labelledBy="zemara-permissions-title">
+      <Suspense fallback={<GateBusyPane />}>
+        {ready ? (
+          <PermissionsOnboardingPanel
+            onComplete={onComplete}
+            screenAccess={{ status: screenStatus, refresh: refreshScreenStatus }}
+            titleId="zemara-permissions-title"
+          />
+        ) : (
+          <GateBusyPane />
+        )}
+      </Suspense>
+    </GateSurface>
+  )
+}
+
+function GateBusyPane(): ReactElement {
+  return (
+    <div
+      aria-live="polite"
+      className="flex flex-1 flex-col items-center justify-center gap-3"
+      role="status"
+    >
+      <CircleNotch className="size-6 animate-spin text-muted-foreground" />
+      <p className="text-sm text-muted-foreground">Getting Zemara ready…</p>
+    </div>
   )
 }
 
@@ -181,6 +187,12 @@ export function AppShell(): ReactElement {
   const [termsAccepted, setTermsAccepted] = useState(
     () => localStorage.getItem(STORAGE_KEYS.termsAcceptedVersion) === TERMS_VERSION
   )
+  // First-run permissions step: until this flag exists the app shell never
+  // mounts — the window shows only the gate chain (agreement → welcome →
+  // permissions), so no workspace UI or detached window can appear early.
+  const [permissionsStepDone, setPermissionsStepDone] = useState(
+    () => localStorage.getItem(STORAGE_KEYS.onboarding) !== null
+  )
   // A truly brand-new install (never accepted terms, never initialized the
   // what's-new tracker) gets a welcome "what's new" right after agreeing,
   // instead of the normal post-update-only behavior — captured once at
@@ -190,7 +202,7 @@ export function AppShell(): ReactElement {
       localStorage.getItem(WHATS_NEW_STORAGE_KEY) === null
   )
   const [welcomePending, setWelcomePending] = useState(false)
-  const whatsNew = useWhatsNew(runtimeInfo?.version)
+  const whatsNew = useWhatsNew(runtimeInfo?.version, runtimeInfo?.platform)
   const acceptTerms = useCallback(() => {
     localStorage.setItem(STORAGE_KEYS.termsAcceptedVersion, TERMS_VERSION)
     setTermsAccepted(true)
@@ -205,7 +217,15 @@ export function AppShell(): ReactElement {
   // view in between. Routine post-update what's-new (existing users) is
   // unaffected — that still overlays the already-familiar app as before.
   const showingWelcomeGate = isFreshInstallRef.current && (welcomePending || whatsNew.open)
-  const showingFirstRunGate = !termsAccepted || showingWelcomeGate
+  // Church sign-in runs after the first-run gates, inside AdminBackendProvider
+  // (its identity lives there) — the gate reports its visibility up so the
+  // window stays in the small gated size, single-owner setWindowGated.
+  const [churchGateActive, setChurchGateActive] = useState(false)
+  const handleChurchGateChange = useCallback((active: boolean): void => {
+    setChurchGateActive(active)
+  }, [])
+  const showingFirstRunGate =
+    !termsAccepted || showingWelcomeGate || !permissionsStepDone || churchGateActive
   // Shrinks the window to a small centered panel while a gate is showing —
   // a native-style license panel, not a full workspace window with a small
   // dialog floating inside a mostly-empty black rectangle.
@@ -241,11 +261,13 @@ export function AppShell(): ReactElement {
 
   const completeOnboarding = useCallback(() => {
     localStorage.setItem(STORAGE_KEYS.onboarding, ONBOARDING_DISMISSED_VALUE)
+    setPermissionsStepDone(true)
     setOnboardingOpen(false)
   }, [])
 
-  // Settings' "Set up permissions": force-open regardless of grants or the
-  // dismissal flag — no flag clearing, closing just re-dismisses.
+  // Settings' "Set up permissions": force-open the dialog over the app
+  // regardless of grants or the dismissal flag — no flag clearing, closing
+  // just re-dismisses.
   const openPermissionsSetup = useCallback(() => {
     setOnboardingOpen(true)
   }, [])
@@ -377,172 +399,195 @@ export function AppShell(): ReactElement {
           survives tab switches instead of resetting each time (see
           admin-backend-provider.tsx). */}
       <AdminBackendProvider>
-      {!termsAccepted ? (
-        <TermsAgreementDialog open onAgree={acceptTerms} />
-      ) : showingWelcomeGate ? (
-        <WhatsNewDialog
-          entry={whatsNew.entry}
-          open={whatsNew.open}
-          onClose={whatsNew.dismiss}
-        />
-      ) : (
-      <div className="flex min-h-screen pt-9 text-foreground" data-videorc-active-tab={active}>
-        <Sidebar
-          active={active}
-          activeStudioPanel={isStudioPanel(active) ? active : null}
-          accountTier={entitlementTier}
-          onSelect={setActive}
-          onSelectStudioPanel={openStudioPanel}
-          statusTone={statusTone}
-          statusLabel={statusLabel}
-          live={live}
-          onOpenCommand={() => setCommandOpen(true)}
-          platform={runtimeInfo?.platform}
-        />
+        {!termsAccepted ? (
+          <GateSurface labelledBy="zemara-terms-title">
+            <TermsAgreementPanel onAgree={acceptTerms} />
+          </GateSurface>
+        ) : showingWelcomeGate ? (
+          <GateSurface labelledBy="zemara-welcome-title">
+            {whatsNew.entry ? (
+              <WhatsNewPanel entry={whatsNew.entry} onClose={whatsNew.dismiss} />
+            ) : (
+              <div aria-live="polite" className="flex flex-col items-center gap-3" role="status">
+                <CircleNotch className="size-6 animate-spin text-muted-foreground" />
+                <p className="text-sm text-muted-foreground">Getting Zemara ready…</p>
+              </div>
+            )}
+          </GateSurface>
+        ) : !permissionsStepDone ? (
+          <PermissionsFirstRunGate onComplete={completeOnboarding} />
+        ) : (
+          <ChurchSignInGate onGateChange={handleChurchGateChange}>
+            <div
+              className="flex min-h-screen pt-9 text-foreground"
+              data-videorc-active-tab={active}
+            >
+              <Sidebar
+                active={active}
+                activeStudioPanel={isStudioPanel(active) ? active : null}
+                accountTier={entitlementTier}
+                onSelect={setActive}
+                onSelectStudioPanel={openStudioPanel}
+                statusTone={statusTone}
+                statusLabel={statusLabel}
+                live={live}
+                onOpenCommand={() => setCommandOpen(true)}
+                platform={runtimeInfo?.platform}
+              />
 
-        <main className="flex h-[calc(100vh-2.25rem)] flex-1 flex-col">
-          {/* Library manages its own scroll (pinned header/toolbar, only the
+              <main className="flex h-[calc(100vh-2.25rem)] flex-1 flex-col">
+                {/* Library manages its own scroll (pinned header/toolbar, only the
               table scrolls), so it fills the bounded height instead of the
               shell scrolling the whole tab. Living Text is a full-bleed
               production dashboard (its own panel grid, not prose content),
               so it skips the padded max-width wrapper entirely. Every other
               tab scrolls as one. */}
-          <div
-            className={cn(
-              'min-h-0 flex-1',
-              active === 'library' || active === 'livingText'
-                ? 'flex flex-col'
-                : 'app-scroll-region overflow-y-auto'
-            )}
-          >
-            {active === 'livingText' ? (
-              <Suspense fallback={<WorkspaceTabFallback />}>
-                <LivingTextTab />
-              </Suspense>
-            ) : (
-              // pt-4 matches the sidebar header's py-4 so every tab's content
-              // top-aligns with the start of the sidebar.
-              <div
-                className={cn(
-                  'mx-auto w-full max-w-[1600px] px-10 pt-4',
-                  active === 'library' ? 'flex min-h-0 flex-1 flex-col pb-4' : 'pb-8'
-                )}
-              >
-                <Suspense fallback={<WorkspaceTabFallback />}>
-                  {active === 'studio' ? <StudioTab /> : null}
-                  {active === 'sources' ? <SourcesTab /> : null}
-                  {active === 'layouts' ? <LayoutTab /> : null}
-                  {active === 'assets' ? <AssetsTab /> : null}
-                  {active === 'live' ? <StreamingTab /> : null}
-                  {active === 'captions' ? <CaptionsTab /> : null}
-                  {active === 'recording' ? <RecordingTab /> : null}
-                  {active === 'library' ? <LibraryTab onOpenInAi={openInAi} /> : null}
-                  {active === 'sermons' ? <SermonsTab /> : null}
-                  {active === 'videos' ? <VideosTab /> : null}
-                  {active === 'events' ? <EventsTab /> : null}
-                  {active === 'members' ? <MembersTab /> : null}
-                  {active === 'alerts' ? <AlertsTab /> : null}
-                  {active === 'departments' ? <DepartmentsTab /> : null}
-                  {active === 'staffAccess' ? <StaffAccessTab /> : null}
-                  {active === 'ai' ? (
-                    <AiTab
-                      selectedSessionId={selectedSessionId}
-                      setSelectedSessionId={setSelectedSessionId}
-                    />
-                  ) : null}
-                  {active === 'diagnostics' ? <DiagnosticsTab /> : null}
-                  {active === 'settings' ? (
-                    <SettingsTab
-                      onOpenPermissionsSetup={openPermissionsSetup}
-                      onShowWhatsNew={whatsNew.showLatest}
-                    />
-                  ) : null}
-                </Suspense>
-              </div>
-            )}
-          </div>
-          {/* Global footer action bar: the shell's real shortcuts, always
+                <div
+                  className={cn(
+                    'min-h-0 flex-1',
+                    active === 'library' || active === 'livingText'
+                      ? 'flex flex-col'
+                      : 'app-scroll-region overflow-y-auto'
+                  )}
+                >
+                  {active === 'livingText' ? (
+                    <Suspense fallback={<WorkspaceTabFallback />}>
+                      <LivingTextTab />
+                    </Suspense>
+                  ) : (
+                    // pt-4 matches the sidebar header's py-4 so every tab's content
+                    // top-aligns with the start of the sidebar.
+                    <div
+                      className={cn(
+                        'mx-auto w-full max-w-[1600px] px-10 pt-4',
+                        active === 'library' ? 'flex min-h-0 flex-1 flex-col pb-4' : 'pb-8'
+                      )}
+                    >
+                      <StudioMicVisualProvider
+                        enabled={active === 'studio' || active === 'sources'}
+                      >
+                        <Suspense fallback={<WorkspaceTabFallback />}>
+                          {active === 'studio' ? <StudioTab /> : null}
+                          {active === 'sources' ? <SourcesTab /> : null}
+                          {active === 'layouts' ? <LayoutTab /> : null}
+                          {active === 'assets' ? <AssetsTab /> : null}
+                          {active === 'live' ? <StreamingTab /> : null}
+                          {active === 'captions' ? <CaptionsTab /> : null}
+                          {active === 'recording' ? <RecordingTab /> : null}
+                          {active === 'library' ? <LibraryTab onOpenInAi={openInAi} /> : null}
+                          {active === 'sermons' ? <SermonsTab /> : null}
+                          {active === 'videos' ? <VideosTab /> : null}
+                          {active === 'events' ? <EventsTab /> : null}
+                          {active === 'members' ? <MembersTab /> : null}
+                          {active === 'alerts' ? <AlertsTab /> : null}
+                          {active === 'departments' ? <DepartmentsTab /> : null}
+                          {active === 'staffAccess' ? <StaffAccessTab /> : null}
+                          {active === 'ai' ? (
+                            <AiTab
+                              selectedSessionId={selectedSessionId}
+                              setSelectedSessionId={setSelectedSessionId}
+                            />
+                          ) : null}
+                          {active === 'diagnostics' ? <DiagnosticsTab /> : null}
+                          {active === 'settings' ? (
+                            <SettingsTab
+                              onOpenPermissionsSetup={openPermissionsSetup}
+                              onShowWhatsNew={whatsNew.showLatest}
+                            />
+                          ) : null}
+                        </Suspense>
+                      </StudioMicVisualProvider>
+                    </div>
+                  )}
+                </div>
+                {/* Global footer action bar: the shell's real shortcuts, always
               advertised (videorc-design keyboard-first rule). */}
-          <FooterActionBar
-            leading={<span>{workspaceTabLabel(active)}</span>}
-            className="bg-background/60"
-          >
-            <Button size="sm" variant="ghost" onClick={() => setCommandOpen(true)}>
-              Search
-              <KbdGroup>
-                <Kbd>{modKey}</Kbd>
-                <Kbd>K</Kbd>
-              </KbdGroup>
-            </Button>
-            <FooterActionDivider />
-            <Button size="sm" variant="ghost" onClick={() => void togglePreviewWindow()}>
-              {previewWindowOpen ? 'Close Preview' : 'Open Preview'}
-              <KbdGroup>
-                <Kbd>{modKey}</Kbd>
-                <Kbd>P</Kbd>
-              </KbdGroup>
-            </Button>
-            {/* Flags default ON and runtimeInfo lands async — treating null
+                <FooterActionBar
+                  leading={<span>{workspaceTabLabel(active)}</span>}
+                  className="bg-background/60"
+                >
+                  <Button size="sm" variant="ghost" onClick={() => setCommandOpen(true)}>
+                    Search
+                    <KbdGroup>
+                      <Kbd>{modKey}</Kbd>
+                      <Kbd>K</Kbd>
+                    </KbdGroup>
+                  </Button>
+                  <FooterActionDivider />
+                  <Button size="sm" variant="ghost" onClick={() => void togglePreviewWindow()}>
+                    {previewWindowOpen ? 'Close Preview' : 'Open Preview'}
+                    <KbdGroup>
+                      <Kbd>{modKey}</Kbd>
+                      <Kbd>P</Kbd>
+                    </KbdGroup>
+                  </Button>
+                  {/* Flags default ON and runtimeInfo lands async — treating null
                 as enabled keeps the footer at its final width from the first
                 paint instead of growing when the fetch resolves. */}
-            {runtimeInfo?.notesWindowEnabled !== false ? (
-              <>
-                <FooterActionDivider />
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() =>
-                    notesWindowOpen ? void closeNotesWindow() : void openNotesWindow()
-                  }
-                >
-                  {notesWindowOpen ? 'Close Notes' : 'Open Notes'}
-                  <KbdGroup>
-                    <Kbd>{modKey}</Kbd>
-                    <Kbd>{shiftKey}</Kbd>
-                    <Kbd>N</Kbd>
-                  </KbdGroup>
-                </Button>
-              </>
-            ) : null}
-            {runtimeInfo?.commentsWindowEnabled !== false ? (
-              <>
-                <FooterActionDivider />
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  onClick={() =>
-                    commentsWindowOpen ? void closeCommentsWindow() : void openCommentsWindow()
-                  }
-                >
-                  <ChatCircle data-icon="inline-start" />
-                  {commentsWindowOpen ? 'Close Comments' : 'Open Comments'}
-                  <KbdGroup>
-                    <Kbd>{modKey}</Kbd>
-                    <Kbd>{shiftKey}</Kbd>
-                    <Kbd>J</Kbd>
-                  </KbdGroup>
-                </Button>
-              </>
-            ) : null}
-          </FooterActionBar>
-        </main>
+                  {runtimeInfo?.notesWindowEnabled !== false ? (
+                    <>
+                      <FooterActionDivider />
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() =>
+                          notesWindowOpen ? void closeNotesWindow() : void openNotesWindow()
+                        }
+                      >
+                        {notesWindowOpen ? 'Close Notes' : 'Open Notes'}
+                        <KbdGroup>
+                          <Kbd>{modKey}</Kbd>
+                          <Kbd>{shiftKey}</Kbd>
+                          <Kbd>N</Kbd>
+                        </KbdGroup>
+                      </Button>
+                    </>
+                  ) : null}
+                  {runtimeInfo?.commentsWindowEnabled !== false ? (
+                    <>
+                      <FooterActionDivider />
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() =>
+                          commentsWindowOpen
+                            ? void closeCommentsWindow()
+                            : void openCommentsWindow()
+                        }
+                      >
+                        <ChatCircle data-icon="inline-start" />
+                        {commentsWindowOpen ? 'Close Comments' : 'Open Comments'}
+                        <KbdGroup>
+                          <Kbd>{modKey}</Kbd>
+                          <Kbd>{shiftKey}</Kbd>
+                          <Kbd>J</Kbd>
+                        </KbdGroup>
+                      </Button>
+                    </>
+                  ) : null}
+                </FooterActionBar>
+              </main>
 
-        <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} />
-        <PermissionsOnboardingGate
-          open={onboardingOpen}
-          onOpen={openPermissionsSetup}
-          onComplete={completeOnboarding}
-        />
-        {/* Post-update highlights for already-onboarded users; suppressed
+              <CommandPalette open={commandOpen} onOpenChange={setCommandOpen} />
+              {/* Manual re-open from Settings → System access. The automatic
+            first-run case is the full-window gate chain above, before the app
+            ever mounts. */}
+              <Suspense fallback={null}>
+                {onboardingOpen ? (
+                  <PermissionsOnboardingDialog open onComplete={completeOnboarding} />
+                ) : null}
+              </Suspense>
+              {/* Post-update highlights for already-onboarded users; suppressed
             behind permissions onboarding. The fresh-install welcome case is
             handled by the gate above this branch, before the app ever mounts. */}
-        <WhatsNewDialog
-          entry={whatsNew.entry}
-          open={whatsNew.open && !onboardingOpen}
-          onClose={whatsNew.dismiss}
-        />
-      </div>
-      )}
+              <WhatsNewDialog
+                entry={whatsNew.entry}
+                open={whatsNew.open && !onboardingOpen}
+                onClose={whatsNew.dismiss}
+              />
+            </div>
+          </ChurchSignInGate>
+        )}
       </AdminBackendProvider>
     </WorkspaceNavContext.Provider>
   )

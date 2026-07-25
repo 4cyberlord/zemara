@@ -22,6 +22,7 @@ import {
   FieldLabel,
   FieldTitle
 } from '@/components/ui/field'
+import { Input } from '@/components/ui/input'
 import { Kbd, KbdGroup } from '@/components/ui/kbd'
 import { Switch } from '@/components/ui/switch'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
@@ -40,6 +41,7 @@ import {
 } from '@/lib/captions-ui'
 import type { CaptionBurnTarget, CaptionsCaptureSettings } from '@/lib/capture'
 import { cloudAiUploadGate } from '@/lib/entitlement-ui'
+import { displayKeyGlyph } from '@/lib/platform'
 import { cn } from '@/lib/utils'
 
 const LANGUAGES = [
@@ -185,23 +187,29 @@ export function CaptionsControls(): ReactElement {
     captureConfig,
     entitlements,
     isSessionActive,
+    runtimeInfo,
     setCaptureConfig,
     startCaptions,
     toggleCaptionsWindow
   } = useStudioCore()
   const captions = captureConfig.captions
   const gate = cloudAiUploadGate(entitlements)
+  // On-device transcription costs nothing and needs no account — the premium
+  // gate only applies to network providers.
+  const engineIsLocal = captions.provider === 'local'
   const runtimeActive = captionsStatusIsActive(captionsStatus)
   const status = captionsStatusPresentation(captionsStatus, captions.enabled, isSessionActive)
   const lines = captionStripLines(captionLines)
   const finalAnnouncement = latestFinalCaptionText(captionLines)
   const streamChecked = captions.burnTarget === 'stream' || captions.burnTarget === 'both'
   const recordingChecked = captions.burnTarget === 'recording' || captions.burnTarget === 'both'
-  const canEnable = gate.allowed || captions.enabled
+  const canEnable = gate.allowed || engineIsLocal || captions.enabled
   const showRetry =
     captions.enabled &&
     isSessionActive &&
     (captionsStatus.state === 'blocked' || captionsStatus.state === 'error')
+  const modKey = displayKeyGlyph('⌘', runtimeInfo?.platform)
+  const shiftKey = displayKeyGlyph('⇧', runtimeInfo?.platform)
 
   const patchCaptions = (
     patch: Partial<CaptionsCaptureSettings>,
@@ -257,7 +265,7 @@ export function CaptionsControls(): ReactElement {
           />
         </Field>
 
-        {!gate.allowed ? (
+        {!gate.allowed && !engineIsLocal ? (
           <Alert variant="warning">
             <WarningCircle weight="fill" />
             <AlertTitle>Premium captions</AlertTitle>
@@ -398,6 +406,53 @@ export function CaptionsControls(): ReactElement {
 
         <Field>
           <FieldContent>
+            <FieldLabel htmlFor="caption-engine">Speech engine</FieldLabel>
+            <FieldDescription>
+              {captions.provider === 'local'
+                ? 'On-device — no account or key needed; first use downloads the speech model once (~74 MB).'
+                : 'Cloud — uses your own Deepgram key, or the signed-in Zemara account without one.'}
+            </FieldDescription>
+          </FieldContent>
+          <AppSelect
+            className="w-full"
+            id="caption-engine"
+            value={captions.provider}
+            onValueChange={(value) => {
+              if (value === 'local' || value === 'cloud') {
+                patchCaptions({ provider: value })
+              }
+            }}
+            options={[
+              { value: 'local', label: 'Manual — on-device' },
+              { value: 'cloud', label: 'Cloud — Deepgram / account' }
+            ]}
+          />
+        </Field>
+
+        {captions.provider === 'cloud' ? (
+          <Field>
+            <FieldContent>
+              <FieldLabel htmlFor="caption-deepgram-key">Deepgram API key</FieldLabel>
+              <FieldDescription>
+                Get a key at deepgram.com — it is stored only on this device.
+              </FieldDescription>
+            </FieldContent>
+            <Input
+              id="caption-deepgram-key"
+              type="password"
+              autoComplete="off"
+              placeholder="Paste your Deepgram API key"
+              className="w-full"
+              value={captions.deepgramApiKey ?? ''}
+              onChange={(event) =>
+                patchCaptions({ deepgramApiKey: event.target.value.trim() || null })
+              }
+            />
+          </Field>
+        ) : null}
+
+        <Field>
+          <FieldContent>
             <FieldLabel htmlFor="caption-language">Spoken language</FieldLabel>
             <FieldDescription>
               {isSessionActive
@@ -485,8 +540,8 @@ export function CaptionsControls(): ReactElement {
             <ArrowSquareOut data-icon="inline-start" />
             {captionsWindow.open ? 'Close reader' : 'Open reader'}
             <KbdGroup className="ml-1">
-              <Kbd>⌘</Kbd>
-              <Kbd>⇧</Kbd>
+              <Kbd>{modKey}</Kbd>
+              <Kbd>{shiftKey}</Kbd>
               <Kbd>C</Kbd>
             </KbdGroup>
           </Button>

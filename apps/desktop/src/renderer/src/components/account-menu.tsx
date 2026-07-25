@@ -1,7 +1,8 @@
-import { GearSix, Pulse, SignIn, SignOut, Sparkle, UserCircle } from '@phosphor-icons/react'
+import { Church, GearSix, Pulse, SignIn, SignOut, Sparkle, UserCircle } from '@phosphor-icons/react'
 import { useEffect, useState, type ReactElement } from 'react'
 
 import { StatusDot, type StatusDotTone } from '@/components/status-dot'
+import { useAdminBackendContext } from '@/components/admin-backend-provider'
 import { AvatarCircle } from '@/lib/chat-avatar'
 import {
   DropdownMenu,
@@ -41,10 +42,22 @@ export function AccountMenu({
   onOpenSettings: () => void
 }): ReactElement {
   const { account, signIn, openAccount, signOut } = useVideorcAccount()
+  const { identity: churchIdentity, signOut: churchSignOut } = useAdminBackendContext()
   const signedIn = isSignedIn(account)
   const displayName = accountDisplayName(account)
   const tierLabel = entitlementTierLabel(tier)
   const [open, setOpen] = useState(false)
+
+  const reopenChurchSignIn = (): void => {
+    window.dispatchEvent(new Event('videorc:reopen-church-sign-in'))
+    setOpen(false)
+  }
+
+  const handleChurchSignOut = (): void => {
+    // Identity flips to null — the workspace gate reappears on its own.
+    void churchSignOut().catch(() => undefined)
+    setOpen(false)
+  }
 
   // FX5: workspace navigation arrives via main-process IPC (⌘1–9) or the
   // custom navigate event — neither is a DOM interaction Radix can see, so
@@ -100,6 +113,36 @@ export function AccountMenu({
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" side="top" className="w-56">
+        {/* Church staff session (admin backend) — who is at this desk and
+            which church this studio belongs to. Distinct from the Zemara
+            product account below. */}
+        {churchIdentity ? (
+          <>
+            <DropdownMenuLabel className="flex flex-col items-start gap-0.5 py-1.5">
+              <span className="flex min-w-0 items-center gap-2 text-sm font-medium text-foreground">
+                <Church className="size-4 shrink-0 text-muted-foreground" />
+                <span className="truncate">{churchIdentity.organization.name}</span>
+              </span>
+              <span className="truncate pl-6 text-xs text-muted-foreground">
+                {churchIdentity.user.name} · {churchIdentity.user.role}
+              </span>
+            </DropdownMenuLabel>
+            <DropdownMenuItem variant="destructive" onSelect={handleChurchSignOut}>
+              <SignOut />
+              Sign out of church
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+          </>
+        ) : (
+          <>
+            <DropdownMenuItem onSelect={reopenChurchSignIn}>
+              <Church />
+              Sign in to your church
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+          </>
+        )}
+
         <DropdownMenuLabel className="flex items-center justify-between gap-2 py-1.5">
           <span className="flex min-w-0 items-center gap-2">
             {account.status === 'signed-in' && account.avatarUrl ? (

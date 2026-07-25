@@ -120,15 +120,21 @@ export function AdminLocationsSection(): ReactElement {
         toast.success(editing ? 'Location updated.' : 'Location created.')
         closeDialog()
       })
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not save this location.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not save this location.')
+      )
       .finally(() => setSavePending(false))
   }
 
   const handleArchiveToggle = (location: Location): void => {
     const nextStatus = location.status === 'archived' ? 'active' : 'archived'
     updateLocation(location.id, { status: nextStatus })
-      .then(() => toast.success(nextStatus === 'archived' ? 'Location archived.' : 'Location restored.'))
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not update this location.'))
+      .then(() =>
+        toast.success(nextStatus === 'archived' ? 'Location archived.' : 'Location restored.')
+      )
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not update this location.')
+      )
   }
 
   return (
@@ -170,14 +176,23 @@ export function AdminLocationsSection(): ReactElement {
                     <Star weight="fill" className="size-3.5 text-primary" />
                   ) : null}
                   <Badge variant="secondary">{locationTypeLabel(location.type)}</Badge>
-                  {location.status === 'archived' ? <Badge variant="outline">Archived</Badge> : null}
+                  {location.status === 'archived' ? (
+                    <Badge variant="outline">Archived</Badge>
+                  ) : null}
                 </div>
                 <div className="text-xs text-muted-foreground">
                   {[location.city, location.country].filter(Boolean).join(', ') || 'No address set'}
-                  {location._count ? ` · ${location._count.members} members · ${location._count.events} events` : ''}
+                  {location._count
+                    ? ` · ${location._count.members} members · ${location._count.events} events`
+                    : ''}
                 </div>
               </div>
-              <Button size="icon" variant="ghost" aria-label="Edit location" onClick={() => openEdit(location)}>
+              <Button
+                size="icon"
+                variant="ghost"
+                aria-label="Edit location"
+                onClick={() => openEdit(location)}
+              >
                 <PencilSimple className="size-4" />
               </Button>
             </div>
@@ -200,7 +215,9 @@ export function AdminLocationsSection(): ReactElement {
               <Input
                 id="location-name"
                 value={form.name}
-                onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))}
+                onChange={(event) =>
+                  setForm((current) => ({ ...current, name: event.target.value }))
+                }
                 placeholder="Nashville Branch"
               />
             </Field>
@@ -210,7 +227,9 @@ export function AdminLocationsSection(): ReactElement {
               <AppSelect
                 className="w-full"
                 value={form.type}
-                onValueChange={(value) => setForm((current) => ({ ...current, type: value as LocationType }))}
+                onValueChange={(value) =>
+                  setForm((current) => ({ ...current, type: value as LocationType }))
+                }
                 options={LOCATION_TYPES.map((type) => ({
                   value: type,
                   label: LOCATION_TYPE_LABELS[type]
@@ -224,7 +243,9 @@ export function AdminLocationsSection(): ReactElement {
                 <Input
                   id="location-city"
                   value={form.city}
-                  onChange={(event) => setForm((current) => ({ ...current, city: event.target.value }))}
+                  onChange={(event) =>
+                    setForm((current) => ({ ...current, city: event.target.value }))
+                  }
                 />
               </Field>
               <Field>
@@ -232,7 +253,9 @@ export function AdminLocationsSection(): ReactElement {
                 <Input
                   id="location-country"
                   value={form.country}
-                  onChange={(event) => setForm((current) => ({ ...current, country: event.target.value }))}
+                  onChange={(event) =>
+                    setForm((current) => ({ ...current, country: event.target.value }))
+                  }
                 />
               </Field>
             </div>
@@ -244,18 +267,24 @@ export function AdminLocationsSection(): ReactElement {
               </div>
               <Switch
                 checked={form.isHeadquarters}
-                onCheckedChange={(checked) => setForm((current) => ({ ...current, isHeadquarters: checked }))}
+                onCheckedChange={(checked) =>
+                  setForm((current) => ({ ...current, isHeadquarters: checked }))
+                }
               />
             </div>
 
             <div className="flex items-center justify-between rounded-xl border p-3">
               <div>
                 <p className="text-sm font-medium text-foreground">Online only</p>
-                <p className="text-xs text-muted-foreground">No physical address, e.g. an online campus.</p>
+                <p className="text-xs text-muted-foreground">
+                  No physical address, e.g. an online campus.
+                </p>
               </div>
               <Switch
                 checked={form.isOnline}
-                onCheckedChange={(checked) => setForm((current) => ({ ...current, isOnline: checked }))}
+                onCheckedChange={(checked) =>
+                  setForm((current) => ({ ...current, isOnline: checked }))
+                }
               />
             </div>
 

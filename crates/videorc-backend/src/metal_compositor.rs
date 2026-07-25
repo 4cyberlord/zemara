@@ -17,6 +17,8 @@
 
 use std::ffi::c_void;
 use std::ptr::NonNull;
+use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::Instant;
 
 use objc2::rc::Retained;
@@ -39,7 +41,7 @@ use objc2_metal::{
 };
 use objc2_quartz_core::{CAMetalDrawable, CAMetalLayer};
 
-use crate::color::rgb_to_yuv_full_range_bt601 as rgb_to_yuv;
+use crate::color::rgb_to_yuv_video_range_bt709 as rgb_to_yuv;
 
 type MetalDevice = ProtocolObject<dyn MTLDevice>;
 type MetalTexture = ProtocolObject<dyn MTLTexture>;
@@ -54,11 +56,11 @@ struct FragParams {
     float circle;
     float aspect;
     float radius;
-    // Chroma key, mirroring scene_geometry's f64 reference keyer:
-    // chroma_key = (enabled, key_cb, key_cr, threshold); chroma_key2 =
-    // (band, spill, spill_is_blue, reserved). CbCr and distances are in
-    // 0..255 units with the SAME -43/-85/128 and 128/-107/-21 coefficient
-    // family as color.rs — if these drift, the CPU and GPU keyers disagree.
+    // Chroma key, mirroring scene_geometry's f64 reference keyer (ANGLE
+    // model): chroma_key = (enabled, key_dir_cb, key_dir_cr, max_angle_rad);
+    // chroma_key2 = (band_rad, spill, spill_is_blue, saturation_floor).
+    // CbCr uses the SAME -43/-85/128 and 128/-107/-21 coefficient family as
+    // color.rs — if these drift, the CPU and GPU keyers disagree.
     float4 chroma_key;
     float4 chroma_key2;
 };
@@ -117,20 +119,30 @@ fragment float4 f_main(VOut in [[stage_in]],
     float2 src = float2(cl + u * (1.0 - cl - cr), ct + uv.y * (1.0 - ct - cb));
     float4 color = tex.sample(samp, src);
     // Chroma key (scene_geometry::chroma_key_alpha / chroma_key_despill in
-    // f32): CbCr distance from the key ramps alpha 0->1 across the band, and
-    // spill pulls the dominant key channel down toward the other channels'
-    // max. The quad must be drawn on the blending pipeline for the computed
-    // alpha to matter.
+    // f32, ANGLE model): the angle between the pixel's CbCr vector and the
+    // key direction ramps alpha 0->1 across the band; a saturation floor
+    // (ramp width 6.0, mirroring CHROMA_KEY_SATURATION_RAMP) pulls greys
+    // back to opaque. Spill pulls the dominant key channel down toward the
+    // other channels' max. The quad must be drawn on the blending pipeline
+    // for the computed alpha to matter.
     if (params.chroma_key.x > 0.5) {
         float r = color.r * 255.0, g = color.g * 255.0, b = color.b * 255.0;
-        float dcb = 128.0 + (-43.0 * r - 85.0 * g + 128.0 * b) / 256.0 - params.chroma_key.y;
-        float dcr = 128.0 + (128.0 * r - 107.0 * g - 21.0 * b) / 256.0 - params.chroma_key.z;
-        float dist = sqrt(dcb * dcb + dcr * dcr);
-        float threshold = params.chroma_key.w;
-        float band = params.chroma_key2.x;
-        float alpha = (band > 0.0)
-            ? clamp((dist - threshold) / band, 0.0, 1.0)
-            : (dist <= threshold ? 0.0 : 1.0);
+        float vcb = (-43.0 * r - 85.0 * g + 128.0 * b) / 256.0;
+        float vcr = (128.0 * r - 107.0 * g - 21.0 * b) / 256.0;
+        float saturation = sqrt(vcb * vcb + vcr * vcr);
+        float angle_alpha = 1.0;
+        if (saturation > 1e-4) {
+            float cos_theta = clamp(
+                (vcb * params.chroma_key.y + vcr * params.chroma_key.z) / saturation, -1.0, 1.0);
+            float theta = acos(cos_theta);
+            float max_angle = params.chroma_key.w;
+            float band = params.chroma_key2.x;
+            angle_alpha = (band > 0.0)
+                ? clamp((theta - max_angle) / band, 0.0, 1.0)
+                : (theta <= max_angle ? 0.0 : 1.0);
+        }
+        float eligibility = clamp((saturation - params.chroma_key2.w) / 6.0, 0.0, 1.0);
+        float alpha = 1.0 - eligibility * (1.0 - angle_alpha);
         float spill = params.chroma_key2.y;
         if (spill > 0.0) {
             if (params.chroma_key2.z > 0.5) {
@@ -168,27 +180,33 @@ struct FragParams {
 
 /// Per-quad chroma key in shader units, converted once from
 /// `scene_geometry::ChromaKeySpec` at the compositor bridge (the spec stays
-/// the single source; this is just its f32 projection).
+/// the single source; this is just its f32 projection). Angle model: the key
+/// is a unit CbCr DIRECTION plus a max angle and ramp band in radians.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct GpuChromaKey {
-    pub key_cb: f32,
-    pub key_cr: f32,
-    pub threshold: f32,
-    pub band: f32,
+    pub key_dir_cb: f32,
+    pub key_dir_cr: f32,
+    pub max_angle_rad: f32,
+    pub band_rad: f32,
     pub spill: f32,
     pub spill_is_blue: bool,
 }
+
+/// Mirrors scene_geometry::CHROMA_KEY_SATURATION_FLOOR / _RAMP — if these
+/// drift the CPU and GPU keyers disagree about which greys survive.
+const CHROMA_KEY_SATURATION_FLOOR: f32 = 14.0;
+const CHROMA_KEY_SATURATION_RAMP: f32 = 6.0;
 
 impl GpuChromaKey {
     fn frag_params(source: Option<&GpuChromaKey>) -> ([f32; 4], [f32; 4]) {
         match source {
             Some(key) => (
-                [1.0, key.key_cb, key.key_cr, key.threshold],
+                [1.0, key.key_dir_cb, key.key_dir_cr, key.max_angle_rad],
                 [
-                    key.band,
+                    key.band_rad,
                     key.spill,
                     if key.spill_is_blue { 1.0 } else { 0.0 },
-                    0.0,
+                    CHROMA_KEY_SATURATION_FLOOR,
                 ],
             ),
             None => ([0.0; 4], [0.0; 4]),
@@ -497,6 +515,9 @@ pub fn composite_sources(
 // moving content (the camera circle). With the ring, frame N is presented and
 // encoded from a slot no render touches again until N+TARGET_RING_SIZE.
 const TARGET_RING_SIZE: usize = 3;
+/// Growth headroom when every base slot is held by an in-flight encode; the
+/// VideoToolbox frame-delay cap (≤2) makes reaching this bound an anomaly.
+const TARGET_RING_MAX_SIZE: usize = TARGET_RING_SIZE + 2;
 
 pub struct MetalSceneCompositor {
     device: Retained<MetalDevice>,
@@ -518,6 +539,11 @@ pub struct MetalSceneCompositor {
 struct CachedTargetTexture {
     texture: Retained<MetalTexture>,
     pixel_buffer: Option<CFRetained<CVPixelBuffer>>,
+    /// Number of consumers (VideoToolbox encodes) still holding this slot's
+    /// frame. The ring must NEVER hand a slot back to the renderer while an
+    /// encode is in flight — the 0.9.44 regression let an uncapped encoder
+    /// pipeline hold >2 slots and the ring scribbled over frames mid-encode.
+    in_flight: Arc<AtomicUsize>,
 }
 
 struct CachedSourceTexture {
@@ -619,6 +645,22 @@ pub struct MetalCompositorTargetPixelBuffer {
     pixel_buffer: CFRetained<CVPixelBuffer>,
     width: usize,
     height: usize,
+    in_flight: Arc<AtomicUsize>,
+}
+
+/// RAII mark that a consumer (a VideoToolbox encode) still needs this ring
+/// slot's pixels. While any guard lives, `ensure_target_texture` will not
+/// select the slot for rendering. Dropping the guard (encode callback done,
+/// or an encode submission error unwinding) releases the slot.
+pub struct MetalTargetInFlightGuard {
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl Drop for MetalTargetInFlightGuard {
+    fn drop(&mut self) {
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
 }
 
 impl MetalCompositorTargetPixelBuffer {
@@ -640,6 +682,17 @@ impl MetalCompositorTargetPixelBuffer {
 
     pub fn has_iosurface(&self) -> bool {
         CVPixelBufferGetIOSurface(Some(self.pixel_buffer.as_ref())).is_some()
+    }
+
+    /// Mark this target's ring slot as consumed by an in-flight encode. Hold
+    /// the guard until the encoder no longer reads the pixels (output
+    /// callback complete).
+    pub fn begin_in_flight(&self) -> MetalTargetInFlightGuard {
+        self.in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        MetalTargetInFlightGuard {
+            in_flight: self.in_flight.clone(),
+        }
     }
 
     pub fn iosurface_id(&self) -> Option<u32> {
@@ -900,6 +953,7 @@ impl MetalSceneCompositor {
             pixel_buffer: target.pixel_buffer.as_ref()?.clone(),
             width: self.target_width,
             height: self.target_height,
+            in_flight: target.in_flight.clone(),
         })
     }
 
@@ -919,8 +973,31 @@ impl MetalSceneCompositor {
             self.target_cursor = self.targets.len() - 1;
             return Some(());
         }
-        self.target_cursor = (self.target_cursor + 1) % TARGET_RING_SIZE;
-        Some(())
+        // Never render into a slot an encode still holds (in-flight guard):
+        // walk the ring for a free slot, and if every slot is held — an
+        // encoder pipelining anomaly — grow by a bounded number of extra
+        // slots rather than scribbling over frames mid-encode.
+        let ring_len = self.targets.len();
+        for step in 1..=ring_len {
+            let candidate = (self.target_cursor + step) % ring_len;
+            if self.targets[candidate]
+                .in_flight
+                .load(std::sync::atomic::Ordering::Acquire)
+                == 0
+            {
+                self.target_cursor = candidate;
+                return Some(());
+            }
+        }
+        if self.targets.len() < TARGET_RING_MAX_SIZE {
+            self.targets
+                .push(make_target_texture(&self.device, width, height)?);
+            self.target_cursor = self.targets.len() - 1;
+            return Some(());
+        }
+        // Pathological: every slot (including growth headroom) is held.
+        // Skipping this compose is strictly better than corrupting frames.
+        None
     }
 
     // The slot most recently selected by `ensure_target_texture` — during a
@@ -1440,6 +1517,7 @@ fn make_target_texture(
         .map(|texture| CachedTargetTexture {
             texture,
             pixel_buffer: None,
+            in_flight: Arc::new(AtomicUsize::new(0)),
         })
     })
 }
@@ -1465,6 +1543,7 @@ fn make_iosurface_target_texture(
     Some(CachedTargetTexture {
         texture,
         pixel_buffer: Some(pixel_buffer),
+        in_flight: Arc::new(AtomicUsize::new(0)),
     })
 }
 
@@ -1777,14 +1856,16 @@ mod tests {
     }
 
     #[test]
-    fn bgra_to_yuv420p_matches_full_range_bt601() {
-        // 4×4 solid red. BGRA red = [0, 0, 255, 255]. Full-range BT.601: Y=76, U=85, V=255.
+    fn bgra_to_yuv420p_matches_video_range_bt709() {
+        // 4×4 solid red. BGRA red = [0, 0, 255, 255]. Video-range BT.709:
+        // Y=63, U=102, V=240 (the recording colorimetry law — matches the
+        // color.rs round-trip fixtures and the tagged bitstream).
         let red = [0u8, 0, 255, 255].repeat(16);
         let yuv = bgra_to_yuv420p(&red, 4, 4);
         assert_eq!(yuv.len(), 16 + 2 * 4); // Y(16) + U(4) + V(4)
-        assert!(yuv[..16].iter().all(|&y| y == 76), "Y plane");
-        assert!(yuv[16..20].iter().all(|&u| u == 85), "U plane");
-        assert!(yuv[20..24].iter().all(|&v| v == 255), "V plane");
+        assert!(yuv[..16].iter().all(|&y| y == 63), "Y plane");
+        assert!(yuv[16..20].iter().all(|&u| u == 102), "U plane");
+        assert!(yuv[20..24].iter().all(|&v| v == 240), "V plane");
     }
 
     #[test]
@@ -1833,8 +1914,8 @@ mod tests {
         }];
         let yuv = compositor.compose_yuv420p(4, 4, &sources).unwrap();
         assert_eq!(yuv.len(), 16 + 2 * 4);
-        assert!(yuv[..16].iter().all(|&y| y == 76), "Y plane red");
-        assert!(yuv[16..20].iter().all(|&u| u == 85), "U plane red");
+        assert!(yuv[..16].iter().all(|&y| y == 63), "Y plane red");
+        assert!(yuv[16..20].iter().all(|&u| u == 102), "U plane red");
     }
 
     #[test]
@@ -1896,14 +1977,17 @@ mod tests {
         assert_eq!(pixel(&px, 1, 0, 0)[..3], [0, 0, 0]);
     }
 
-    /// Green key in the shader's CbCr units — the same -85/-107 coefficient
-    /// family the Rust reference keyer uses.
-    fn green_key(threshold: f32, band: f32, spill: f32) -> GpuChromaKey {
+    /// Pure-green key DIRECTION (unit CbCr vector) with angles in radians —
+    /// the same -85/-107 coefficient family the Rust reference keyer uses.
+    fn green_key(max_angle_deg: f32, band_deg: f32, spill: f32) -> GpuChromaKey {
+        let cb = -85.0_f32 * 255.0 / 256.0;
+        let cr = -107.0_f32 * 255.0 / 256.0;
+        let length = (cb * cb + cr * cr).sqrt();
         GpuChromaKey {
-            key_cb: 128.0 + (-85.0 * 255.0) / 256.0,
-            key_cr: 128.0 + (-107.0 * 255.0) / 256.0,
-            threshold,
-            band,
+            key_dir_cb: cb / length,
+            key_dir_cr: cr / length,
+            max_angle_rad: max_angle_deg.to_radians(),
+            band_rad: band_deg.to_radians(),
             spill,
             spill_is_blue: false,
         }
@@ -1915,30 +1999,33 @@ mod tests {
             eprintln!("skipping: no Metal device available in this environment");
             return;
         };
-        // BGRA texels: key green (keys out), red (kept), a green-grey mix
-        // (partial alpha), grey (kept). Composed over a BLUE background.
+        // BGRA texels: a REALISTIC shadowed screen tone (the 0.9.39 model
+        // failed exactly here), red (kept), a desaturated screen tone in the
+        // saturation-floor ramp (partial), grey (kept). Over a BLUE frame.
         let camera = [
-            0u8, 255, 0, 255, // green
+            40u8, 100, 30, 255, // shadowed screen green (rgb 30,100,40)
             0, 0, 255, 255, // red
-            74, 181, 74, 255, // partial
+            100, 135, 100, 255, // low-saturation screen tone (partial)
             128, 128, 128, 255, // grey
         ];
         let mut source = full_frame(&camera, 4, 1, false, SourceMask::None, [0.0; 4]);
         source.blend = true;
-        source.chroma_key = Some(green_key(72.0, 14.4, 0.0));
+        source.chroma_key = Some(green_key(24.0, 4.8, 0.0));
         let px = compositor
             .compose_bgra(4, 1, [0.0, 0.0, 1.0, 1.0], &[source])
             .unwrap();
         assert_eq!(
             pixel(&px, 4, 0, 0)[..3],
             [255, 0, 0],
-            "key green shows the blue frame"
+            "shadowed REAL screen tone keys with defaults (the 0.9.39 bug)"
         );
         assert_eq!(pixel(&px, 4, 1, 0)[..3], [0, 0, 255], "red survives");
+        // Reference alpha for (100,135,100) is ~55/255 (saturation 18.7 in
+        // the 14..20 ramp): out ≈ src*0.22 + blue*0.78 → BGRA ≈ (221, 30, 22).
         let partial = pixel(&px, 4, 2, 0);
         assert!(
-            partial[1] > 30 && partial[1] < 165 && partial[0] > 60 && partial[0] < 220,
-            "green-grey mix blends fractionally over blue, got {partial:?}"
+            partial[0] > 190 && partial[0] < 245 && partial[1] > 15 && partial[1] < 60,
+            "saturation-ramp tone blends fractionally over blue, got {partial:?}"
         );
         assert_eq!(
             pixel(&px, 4, 3, 0)[..3],
@@ -1958,7 +2045,9 @@ mod tests {
         let camera = [80u8, 200, 100, 255]; // BGRA: r=100 g=200 b=80
         let mut source = full_frame(&camera, 1, 1, false, SourceMask::None, [0.0; 4]);
         source.blend = true;
-        source.chroma_key = Some(green_key(40.0, 0.0, 1.0));
+        // Narrow 5-degree cone: this green-dominant tone sits ~8.5 degrees
+        // off the key direction, so it is KEPT — and only despilled.
+        source.chroma_key = Some(green_key(5.0, 0.0, 1.0));
         let px = compositor
             .compose_bgra(1, 1, [0.0, 0.0, 0.0, 1.0], &[source])
             .unwrap();
@@ -1983,7 +2072,7 @@ mod tests {
         let red = [0u8, 0, 255, 255].repeat(2 * 2);
         let mut source = full_frame(&red, 2, 2, false, SourceMask::Circle, [0.0; 4]);
         source.blend = true;
-        source.chroma_key = Some(green_key(72.0, 14.4, 0.1));
+        source.chroma_key = Some(green_key(24.0, 4.8, 0.1));
         let px = compositor
             .compose_bgra(out, out, [0.0, 0.0, 1.0, 1.0], &[source])
             .unwrap();
@@ -2114,6 +2203,68 @@ mod tests {
             .expect("compose after resize");
         assert_eq!(compositor.cached_target_size(), Some((16, 8)));
         assert_eq!(compositor.target_ring_iosurface_ids().len(), 1);
+    }
+
+    #[test]
+    fn ring_never_reuses_a_slot_held_by_an_in_flight_encode_or_skips() {
+        // The 0.9.44 regression: an uncapped encoder pipeline held >2 ring
+        // slots and `ensure_target_texture` cycled into them anyway,
+        // scribbling over frames mid-encode. With the in-flight guard the
+        // ring must route around held slots (growing if necessary) and only
+        // hand them back once the guard drops.
+        let Some(mut compositor) = MetalSceneCompositor::new() else {
+            eprintln!("skipping: no Metal device available in this environment");
+            return;
+        };
+        let red = [0u8, 0, 255, 255];
+        let sources = [full_frame(&red, 1, 1, false, SourceMask::None, [0.0; 4])];
+
+        // Hold guards on two consecutive composed frames, like an encoder
+        // with two frames in flight.
+        let mut held = Vec::new();
+        for _ in 0..2 {
+            compositor
+                .compose_bgra(8, 4, [0.0, 0.0, 0.0, 1.0], &sources)
+                .expect("compose into ring target");
+            let Some(target) = compositor.latest_target_pixel_buffer() else {
+                eprintln!("skipping: IOSurface-backed render target unavailable on this device");
+                return;
+            };
+            held.push((target.iosurface_id(), target.begin_in_flight(), target));
+        }
+        let held_ids: Vec<_> = held.iter().map(|(id, _, _)| *id).collect();
+
+        // Twice around the (grown) ring: no compose may land on a held slot.
+        for _ in 0..(TARGET_RING_MAX_SIZE * 2) {
+            compositor
+                .compose_bgra(8, 4, [0.0, 0.0, 0.0, 1.0], &sources)
+                .expect("compose must keep succeeding while slots are held");
+            let exported = compositor
+                .latest_target_pixel_buffer()
+                .and_then(|target| target.iosurface_id());
+            assert!(
+                !held_ids.contains(&exported),
+                "compose landed on a slot held by an in-flight encode: {exported:?} in {held_ids:?}"
+            );
+        }
+
+        // Releasing the guards returns the slots to the rotation.
+        drop(held);
+        let mut seen = Vec::new();
+        for _ in 0..(TARGET_RING_MAX_SIZE * 2) {
+            compositor
+                .compose_bgra(8, 4, [0.0, 0.0, 0.0, 1.0], &sources)
+                .expect("compose after guards released");
+            seen.push(
+                compositor
+                    .latest_target_pixel_buffer()
+                    .and_then(|target| target.iosurface_id()),
+            );
+        }
+        assert!(
+            held_ids.iter().any(|id| seen.contains(id)),
+            "released slots should rejoin the rotation: held {held_ids:?}, saw {seen:?}"
+        );
     }
 
     #[test]

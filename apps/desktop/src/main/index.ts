@@ -2,8 +2,8 @@ import {
   app,
   BrowserWindow,
   contentTracing,
-  desktopCapturer,
   dialog,
+  globalShortcut,
   nativeImage,
   nativeTheme,
   net,
@@ -17,6 +17,13 @@ import {
   type NativeImage
 } from 'electron'
 import { randomBytes, randomUUID } from 'node:crypto'
+// In-process Screen Recording permission ask (N-API, CGRequestScreenCaptureAccess).
+// Externalized by electron-vite and lazily touches its .node only when called,
+// so a missing build never breaks app startup on other platforms.
+import {
+  hasPromptedForPermission,
+  hasScreenCapturePermission
+} from '@computer-use/mac-screen-capture-permissions'
 import {
   copyFileSync,
   existsSync,
@@ -25,6 +32,7 @@ import {
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync
@@ -50,7 +58,14 @@ import {
   ownedProcessLedgerPath,
   ownedProcessStartupLockPath
 } from './backend-owned-processes'
-import { stopBackendProcess } from './backend-process-shutdown'
+import { stopBackendProcess, type BackendShutdownResult } from './backend-process-shutdown'
+import {
+  BackendRuntimeOwner,
+  claimDurableBackendPid,
+  requestBackendRuntimeTermination,
+  settleBackendRuntimeExit,
+  type OwnedBackendRuntime
+} from './backend-runtime-owner'
 import {
   acquireBackendInterruptionLease,
   type BackendInterruptionLease
@@ -94,6 +109,12 @@ import { NativePreviewRunAuthority } from './native-preview-run-authority'
 import { loadNativePreviewRealSurfaceDriver } from './native-preview-real-surface-loader'
 import { compositorSceneConflictsWithCommitted } from '../shared/native-preview-scene-authority'
 import { applyCommentsSnapshotDelta } from '../shared/comments-snapshot-delta'
+import {
+  CommentsHistoryCache,
+  CommentsViewSelection,
+  prepareAndSelectCommentsView,
+  type HistoryCommentsView
+} from './comments-history-cache'
 import { compositorStatusFromFrameReady } from '../shared/compositor-frame-ready'
 import {
   validateWindowsLiveAudioSmokeRequest,
@@ -196,11 +217,16 @@ import {
   type WatchdogRunToken
 } from './native-preview-first-frame'
 import { NATIVE_PREVIEW_PROOF_POLLER_RUNTIME_SCRIPT } from './native-preview-proof-poller-runtime'
-import { NATIVE_PREVIEW_PROOF_MEASUREMENT_RUNTIME_SCRIPT } from './native-preview-proof-measurement-runtime'
 import {
+  NATIVE_PREVIEW_PROOF_MEASUREMENT_RUNTIME_SCRIPT,
+  resetNativePreviewProofMeasurementStatus
+} from './native-preview-proof-measurement-runtime'
+import {
+  type NativePreviewProofPollingProfile,
   nativePreviewProofFrameUrl,
   nativePreviewProofPollingProfile,
-  nativePreviewProofPollingProfileKey
+  nativePreviewProofPollingProfileKey,
+  nativePreviewProofPresentStatus
 } from '../shared/native-preview-proof-polling'
 import {
   DEFAULT_MAIN_PUMP_FRAME_STALL_TIMEOUT_MS,
@@ -209,6 +235,10 @@ import {
 } from './native-preview-main-pump-health'
 import { discoverObs, readObsSetup, readObsStreamKey } from './obs-import'
 import { initAutoUpdater, registerUpdaterIpc } from './updater'
+import {
+  sanitizedChildProcessEnvironment,
+  scrubReleaseAuthorityEnvironment
+} from './release-authority-env'
 import { secureIpcHandle, sendElectronEvent } from './secure-ipc'
 import {
   MAX_NOTES_TEXT_LENGTH,
@@ -292,6 +322,7 @@ import type {
   CompositorSceneSourceStatus,
   CompositorStatus,
   LayoutSettings,
+  LiveChatMessage,
   LiveChatSnapshot,
   LivingTextOutputPayload,
   LivingTextOutputState,
@@ -317,6 +348,7 @@ import type {
   StreamScreen,
   SystemPermissionPane,
   RuntimeInfo,
+  SessionCommentsPage,
   VideorcAccountSnapshot,
   ViewerSample
 } from '../shared/backend'
@@ -326,16 +358,94 @@ import type {
 // blank window an operator might assume is broken.
 const DEFAULT_LIVING_TEXT_OUTPUT_PAYLOAD: LivingTextOutputPayload = {
   theme: {
+    backgroundType: 'solid',
     backgroundColor: '#000000',
+    gradientAngle: 135,
+    gradientColorStart: '#0f0c29',
+    gradientColorEnd: '#302b63',
+    backgroundImagePath: null,
+    backgroundImageOpacity: 0.5,
     textColor: '#ffffff',
-    referenceColor: '#f5c451',
     fontSize: 56,
-    textAlign: 'center'
+    fontFamily: 'system-ui, -apple-system, sans-serif',
+    fontWeight: 600,
+    lineHeight: 1.35,
+    letterSpacing: 0,
+    textAlign: 'center',
+    textShadowBlur: 0,
+    textShadowX: 0,
+    textShadowY: 2,
+    textShadowColor: 'rgba(0,0,0,0.6)',
+    textStrokeWidth: 0,
+    textStrokeColor: '#000000',
+    referenceColor: '#f5c451',
+    referenceAlign: 'center',
+    referenceFontSize: 0,
+    verticalPosition: 'center',
+    horizontalPaddingPct: 8,
+    maxWidthPct: 80,
+    displayMode: 'fullscreen',
+    resolutionWidth: 1920,
+    resolutionHeight: 1080
   },
   verse: null
 }
 
 let mainWindow: BrowserWindow | null = null
+
+// ── OS-global shortcuts (remote-control plan RC0) ─────────────────────────
+// Registered system-wide so a Stream Deck's native Hotkey action can drive
+// record/stream/mic with the app unfocused. Off unless the user configures
+// accelerators in Settings; every set call replaces the previous set.
+const registeredGlobalShortcuts = new Set<string>()
+
+function setGlobalShortcuts(shortcuts: {
+  recordToggle?: string
+  streamToggle?: string
+  micToggle?: string
+}): { registered: Record<string, boolean> } {
+  for (const accelerator of registeredGlobalShortcuts) {
+    try {
+      globalShortcut.unregister(accelerator)
+    } catch {
+      // Unregistering a stale accelerator must never block the update.
+    }
+  }
+  registeredGlobalShortcuts.clear()
+  const requested: Array<['record-toggle' | 'stream-toggle' | 'mic-toggle', string | undefined]> = [
+    ['record-toggle', shortcuts.recordToggle],
+    ['stream-toggle', shortcuts.streamToggle],
+    ['mic-toggle', shortcuts.micToggle]
+  ]
+  const registered: Record<string, boolean> = {}
+  for (const [action, accelerator] of requested) {
+    const trimmed = accelerator?.trim()
+    if (!trimmed) {
+      continue
+    }
+    let ok: boolean
+    try {
+      ok = globalShortcut.register(trimmed, () => {
+        const window = mainWindow
+        if (window && !window.isDestroyed()) {
+          sendElectronEvent(window.webContents, 'global-shortcuts:triggered', action)
+        }
+      })
+    } catch {
+      // An invalid accelerator string reports as not registered.
+      ok = false
+    }
+    registered[action] = ok
+    if (ok) {
+      registeredGlobalShortcuts.add(trimmed)
+    }
+  }
+  return { registered }
+}
+
+app.on('will-quit', () => {
+  globalShortcut.unregisterAll()
+})
 let nativePreviewSurfaceWindow: BrowserWindow | null = null
 let notesWindow: BrowserWindow | null = null
 let notesWindowLastFrame: Electron.Rectangle | null = null
@@ -354,10 +464,9 @@ let commentsWindowClosing = false
 let commentsWindowContentProtected = false
 let latestCommentHighlightState: CommentHighlightState = { generation: 0, phase: 'idle' }
 let latestLiveCommentsSnapshot: LiveChatSnapshot | null = null
-const commentsHistorySnapshots = new Map<string, LiveChatSnapshot>()
-let commentsViewMode: CommentsViewMode = { kind: 'live' }
+const commentsHistoryCache = new CommentsHistoryCache()
+const commentsViewSelection = new CommentsViewSelection({ kind: 'live' })
 let latestLiveCommentsSendOperation: CommentsSendOperation | undefined
-const commentsHistorySendOperations = new Map<string, CommentsSendOperation>()
 const commentsCommandBroker = new CommentsCommandBroker()
 type CommentsSmokeCommandFixture =
   | {
@@ -438,7 +547,8 @@ let backendProcess: ChildProcessWithoutNullStreams | null = null
 let backendQuitComplete = false
 let backendQuitInProgress = false
 let backendRestartInProgress: Promise<void> | null = null
-let backendOwnedProcessPids = new Set<number>()
+const backendRuntimeOwner = new BackendRuntimeOwner<ChildProcessWithoutNullStreams>()
+type BackendRuntime = OwnedBackendRuntime<ChildProcessWithoutNullStreams>
 let backendPermissionTargetPath: string | null = null
 let ownedProcessRegistry: OwnedProcessRegistry | null = null
 let ownedProcessRegistryLockDepth = 0
@@ -459,7 +569,6 @@ let nativePreviewCommittedCompositorRunId: string | undefined
 const nativePreviewCompositorRunAuthority = new NativePreviewRunAuthority()
 let nativePreviewPendingSceneRevision: number | null = null
 let nativePreviewSurfaceSceneRevisionGuardUntilMs = 0
-let stdoutBuffer = ''
 let appIsQuitting = false
 let appIcon: NativeImage | null | undefined
 const backendLogs: BackendLogEvent[] = []
@@ -484,7 +593,7 @@ const notesWindowSmokeMarkerEnabled =
   process.env.VIDEORC_NOTES_SMOKE_MARKER === '1' &&
   Boolean(process.env.VIDEORC_SMOKE_OUTPUT_DIR)
 
-app.setName('Videorc')
+app.setName('Zemara')
 // Dark glass is the default theme; the renderer re-syncs this on toggle.
 nativeTheme.themeSource = 'dark'
 // True vibrancy is the default glass; =0 opts out, and any other value picks
@@ -583,6 +692,12 @@ async function refreshGlassWallpaper(): Promise<void> {
 }
 // Lifecycle smokes can isolate the app-level backend ledger without touching
 // the developer's real app data.
+if (app.isPackaged) {
+  // Packaged runtime code never needs build/signing/storage authority. Retain
+  // the operator-only pilot bearer only until updater initialization copies it.
+  scrubReleaseAuthorityEnvironment(process.env, { preservePilotToken: true })
+}
+
 const appDataDirOverride = process.env.VIDEORC_APP_DATA_DIR?.trim()
 if (appDataDirOverride) {
   app.setPath('appData', appDataDirOverride)
@@ -592,6 +707,23 @@ if (appDataDirOverride) {
 const userDataDirOverride = process.env.VIDEORC_USER_DATA_DIR?.trim()
 if (userDataDirOverride) {
   app.setPath('userData', userDataDirOverride)
+}
+// The product was renamed Videorc → Zemara: the Electron profile (settings,
+// sign-in session, window placements) lives in a userData dir named after the
+// app, so carry the old profile forward once instead of silently resetting
+// every operator to factory defaults. Explicit isolation overrides win.
+if (!userDataDirOverride) {
+  try {
+    const legacyUserDataDir = join(app.getPath('appData'), 'Videorc')
+    const currentUserDataDir = app.getPath('userData')
+    if (legacyUserDataDir !== currentUserDataDir && existsSync(legacyUserDataDir)) {
+      if (!existsSync(currentUserDataDir)) {
+        renameSync(legacyUserDataDir, currentUserDataDir)
+      }
+    }
+  } catch (error) {
+    safeConsole.warn(`Could not migrate the legacy Videorc profile directory: ${error}`)
+  }
 }
 // Perf harnesses attach CDP profilers to the renderer through this switch
 // (0 = pick a free port; Chromium prints "DevTools listening on ws://...").
@@ -1313,14 +1445,14 @@ function platformWindowChromeOptions(): BrowserWindowConstructorOptions {
   }
 }
 
-// Base launch size is 1180x780; tripled per request, but clamped to the
-// current display's work area so it can't open larger than the screen on
-// laptops/smaller monitors.
+// Base launch size is 1548x1029 — the workspace size the owner settled on,
+// a wide roomy studio layout. Clamped to the current display's work area so
+// it can't open larger than the screen on laptops/smaller monitors.
 function computeLaunchWindowSize(): { width: number; height: number } {
   const workArea = screen.getPrimaryDisplay().workAreaSize
   return {
-    width: Math.min(3540, workArea.width),
-    height: Math.min(2340, workArea.height)
+    width: Math.min(1548, workArea.width),
+    height: Math.min(1029, workArea.height)
   }
 }
 
@@ -1332,12 +1464,106 @@ function computeLaunchWindowSize(): { width: number; height: number } {
 // dialog floating in it.
 const GATE_WINDOW_SIZE = { width: 640, height: 760 } as const
 
+// Main-side memory of "the first-run gate chain has completed at least once".
+// The renderer owns the real decision (localStorage terms + onboarding keys),
+// but window SIZE and detached-window restores are decided before the
+// renderer exists — without this flag a fresh install would open at full
+// workspace size (and pop the preview window) and only shrink once React
+// mounted, which is exactly the "app visible behind the agreement" leak this
+// gate exists to prevent.
+function firstRunStatePath(): string {
+  return join(app.getPath('userData'), 'first-run.json')
+}
+
+function firstRunCompleted(): boolean {
+  try {
+    return (
+      (JSON.parse(readFileSync(firstRunStatePath(), 'utf8')) as { complete?: boolean }).complete ===
+      true
+    )
+  } catch {
+    return false
+  }
+}
+
+function markFirstRunCompleted(): void {
+  try {
+    writeFileSync(firstRunStatePath(), JSON.stringify({ complete: true }))
+  } catch {
+    // A failed flag write only means the next launch opens compact again.
+  }
+}
+
+// Electron's getMediaAccessStatus('screen') cannot distinguish "macOS was
+// never asked" from "the user denied" — it reports 'denied' whenever the
+// grant is absent. The N-API module @computer-use/mac-screen-capture-permissions
+// tracks the prompt itself (and raises the REAL macOS prompt in-process,
+// attributed to this app bundle — no child-process indirection). The flag
+// file below is the fallback memory for environments where the native
+// module is unavailable.
+function screenAccessAskedPath(): string {
+  return join(app.getPath('userData'), 'screen-access-asked.json')
+}
+
+function screenAccessAsked(): boolean {
+  try {
+    return (
+      (JSON.parse(readFileSync(screenAccessAskedPath(), 'utf8')) as { asked?: boolean }).asked ===
+      true
+    )
+  } catch {
+    return false
+  }
+}
+
+function markScreenAccessAsked(): void {
+  try {
+    writeFileSync(screenAccessAskedPath(), JSON.stringify({ asked: true }))
+  } catch {
+    // A failed flag write only means the next launch offers Grant again.
+  }
+}
+
+// Screen Recording status with the never-asked/denied distinction restored.
+// The native module's own prompt memory is authoritative; the flag file is
+// the fallback when the module cannot load. Never prompts.
+function readScreenAccessStatus(): MediaAccessStatus {
+  try {
+    const raw = systemPreferences.getMediaAccessStatus('screen') as MediaAccessStatus
+    if (raw === 'granted') {
+      return 'granted'
+    }
+    return screenAccessPrompted() ? raw : 'not-determined'
+  } catch (error) {
+    logBackend('warn', `Could not read screen access status: ${errorMessage(error)}`)
+    return 'unknown'
+  }
+}
+
+function screenAccessPrompted(): boolean {
+  try {
+    return hasPromptedForPermission()
+  } catch {
+    // Native module unavailable (e.g. missing build on a contributor
+    // machine) — fall back to our own flag-file memory.
+    return screenAccessAsked()
+  }
+}
+
 function createWindow(): void {
-  const { width: launchWidth, height: launchHeight } = computeLaunchWindowSize()
+  const gatedAtLaunch = !firstRunCompleted()
+  mainWindowGated = gatedAtLaunch
+  const workArea = screen.getPrimaryDisplay().workAreaSize
+  const { width: launchWidth, height: launchHeight } = gatedAtLaunch
+    ? {
+        width: Math.min(GATE_WINDOW_SIZE.width, workArea.width),
+        height: Math.min(GATE_WINDOW_SIZE.height, workArea.height)
+      }
+    : computeLaunchWindowSize()
   mainWindow = new BrowserWindow({
     width: launchWidth,
     height: launchHeight,
-    minWidth: 960,
+    minWidth: gatedAtLaunch ? GATE_WINDOW_SIZE.width : 960,
     minHeight: 660,
     title: 'Zemara',
     // Hold the (transparent) window until the renderer has painted its first
@@ -1498,11 +1724,27 @@ function createWindow(): void {
   }
 
   mainWindow.webContents.once('did-finish-load', () => {
-    restorePreviewWindowOnLaunch()
-    restoreNotesWindowOnLaunch()
-    restoreCommentsWindowOnLaunch()
-    restoreCaptionsWindowOnLaunch()
+    restoreAuxiliaryWindowsOnLaunch()
   })
+}
+
+// Detached windows (preview/notes/comments/captions) auto-restore their
+// previous open state on launch — but NEVER while a first-run gate is up:
+// the user must see only the gate chain until the app is actually ready.
+// The renderer reports gate state via app:set-window-gated; when the gate
+// completes, the ungate transition runs the deferred restore.
+let mainWindowGated = false
+let auxiliaryWindowsRestored = false
+
+function restoreAuxiliaryWindowsOnLaunch(): void {
+  if (mainWindowGated || auxiliaryWindowsRestored) {
+    return
+  }
+  auxiliaryWindowsRestored = true
+  restorePreviewWindowOnLaunch()
+  restoreNotesWindowOnLaunch()
+  restoreCommentsWindowOnLaunch()
+  restoreCaptionsWindowOnLaunch()
 }
 
 // --- Detached preview window (UI rewrite U1) ---------------------------------
@@ -1712,8 +1954,11 @@ function restorePreviewWindowOnLaunch(): void {
   if (!previewWindowAutoRestoreEnabled) {
     return
   }
+  // Only restore when the user explicitly left it open last session — the
+  // default is CLOSED. Auto-opening a floating capture window on every
+  // launch surprised first-run users ("the preview thing always shows up").
   const prefs = loadPreviewWindowPrefs()
-  if (prefs.open !== false) {
+  if (prefs.open === true) {
     void openPreviewWindow()
   }
 }
@@ -2291,7 +2536,7 @@ function livingTextOutputWindowHtml(payload: LivingTextOutputPayload): string {
     <meta http-equiv="Content-Security-Policy" content="${contentSecurityPolicy}">
     <style>
     html, body { margin: 0; height: 100%; overflow: hidden; background: #000;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif; }
     body { display: flex; flex-direction: column; }
     .drag-bar { height: 28px; flex-shrink: 0; display: flex; align-items: center;
       gap: 8px; padding: 0 10px 0 74px; box-sizing: border-box;
@@ -2299,47 +2544,130 @@ function livingTextOutputWindowHtml(payload: LivingTextOutputPayload): string {
       -webkit-app-region: drag; }
     .drag-bar .title { color: rgba(255,255,255,0.55); font-size: 10.5px;
       letter-spacing: .08em; text-transform: uppercase; }
-    .stage { flex: 1; display: flex; align-items: center; justify-content: center;
-      padding: 6% 8%; box-sizing: border-box; text-align: center; }
+    #bg { position: fixed; inset: 0; z-index: 0; background-size: cover;
+      background-position: center; transition: background 0.3s; }
+    #bg-overlay { position: fixed; inset: 0; z-index: 1; }
+    .stage-wrap { position: fixed; inset: 0; z-index: 2; display: flex;
+      flex-direction: column; }
+    .stage { flex: 1; display: flex; flex-direction: column; box-sizing: border-box; }
+    .stage.valign-top    { justify-content: flex-start; }
+    .stage.valign-center { justify-content: center; }
+    .stage.valign-bottom { justify-content: flex-end; }
+    .inner { width: 100%; }
     .verse-text { font-weight: 600; line-height: 1.35; white-space: pre-wrap;
       text-wrap: balance; }
-    .verse-reference { margin-top: 0.6em; font-weight: 500; letter-spacing: .02em;
+    .verse-reference { margin-top: 0.5em; font-weight: 500; letter-spacing: .02em;
       opacity: 0.9; }
-    .placeholder { color: rgba(255,255,255,0.3); font-size: 15px; }
+    .placeholder { color: rgba(255,255,255,0.3); font-size: 15px; text-align: center; }
+    /* Lower-third: pin to bottom */
+    .lower-third .stage { justify-content: flex-end !important; }
+    .lower-third .inner { background: rgba(0,0,0,0.75); padding: 4% 6%; }
   </style></head><body>
     <div class="drag-bar"><span class="title">Bible Verse Output</span></div>
-    <div class="stage" id="stage"></div>
+    <div id="bg"></div>
+    <div id="bg-overlay"></div>
+    <div class="stage-wrap" id="stageWrap">
+      <div class="stage valign-center" id="stage">
+        <div class="inner" id="inner"></div>
+      </div>
+    </div>
     <script nonce="${scriptNonce}">
       (() => {
+        const bg = document.getElementById('bg');
+        const bgOverlay = document.getElementById('bg-overlay');
+        const stageWrap = document.getElementById('stageWrap');
         const stage = document.getElementById('stage');
+        const inner = document.getElementById('inner');
+
+        function applyBackground(theme) {
+          const type = theme.backgroundType || 'solid';
+          if (type === 'gradient') {
+            const angle = theme.gradientAngle ?? 135;
+            const s = theme.gradientColorStart || '#0f0c29';
+            const e = theme.gradientColorEnd || '#302b63';
+            bg.style.background = 'linear-gradient(' + angle + 'deg, ' + s + ', ' + e + ')';
+            bg.style.backgroundImage = '';
+            bgOverlay.style.background = 'transparent';
+          } else if (type === 'image' && theme.backgroundImagePath) {
+            bg.style.background = '#000';
+            bg.style.backgroundImage = 'url("' + theme.backgroundImagePath + '")';
+            bgOverlay.style.background = 'rgba(0,0,0,' + (1 - (theme.backgroundImageOpacity ?? 0.5)) + ')';
+          } else {
+            bg.style.background = theme.backgroundColor || '#000';
+            bg.style.backgroundImage = '';
+            bgOverlay.style.background = 'transparent';
+          }
+        }
 
         function render(payload) {
           const theme = payload.theme;
-          document.body.style.background = theme.backgroundColor;
-          stage.style.textAlign = theme.textAlign;
-          stage.style.justifyContent =
-            theme.textAlign === 'left' ? 'flex-start' : theme.textAlign === 'right' ? 'flex-end' : 'center';
+
+          applyBackground(theme);
+
+          // Display mode
+          const isLowerThird = theme.displayMode === 'lower-third';
+          stageWrap.className = 'stage-wrap' + (isLowerThird ? ' lower-third' : '');
+
+          // Vertical alignment
+          const vPos = theme.verticalPosition || 'center';
+          stage.className = 'stage valign-' + vPos;
+
+          // Padding & max-width
+          const hPad = (theme.horizontalPaddingPct ?? 8) + '%';
+          const maxW = (theme.maxWidthPct ?? 80) + '%';
+          inner.style.padding = '0 ' + hPad;
+          inner.style.maxWidth = maxW;
+          inner.style.margin = '0 auto';
+          inner.style.textAlign = theme.textAlign || 'center';
+
           if (!payload.verse) {
-            stage.innerHTML = '';
-            const placeholder = document.createElement('div');
-            placeholder.className = 'placeholder';
-            placeholder.textContent = 'Bible Verse — waiting for a verse…';
-            stage.appendChild(placeholder);
+            inner.innerHTML = '<div class="placeholder">Bible Verse — waiting for a verse…</div>';
             return;
           }
-          stage.innerHTML = '';
+
+          const shadowParts = [];
+          if (theme.textShadowBlur > 0 || theme.textShadowX !== 0 || theme.textShadowY !== 0) {
+            shadowParts.push(
+              (theme.textShadowX || 0) + 'px ' +
+              (theme.textShadowY || 2) + 'px ' +
+              (theme.textShadowBlur || 0) + 'px ' +
+              (theme.textShadowColor || 'rgba(0,0,0,0.6)')
+            );
+          }
+          const shadow = shadowParts.join(', ') || 'none';
+          const stroke = (theme.textStrokeWidth > 0)
+            ? theme.textStrokeWidth + 'px ' + (theme.textStrokeColor || '#000')
+            : '';
+
+          inner.innerHTML = '';
+
           const verseEl = document.createElement('div');
           verseEl.className = 'verse-text';
-          verseEl.style.color = theme.textColor;
-          verseEl.style.fontSize = theme.fontSize + 'px';
+          verseEl.style.color = theme.textColor || '#fff';
+          verseEl.style.fontSize = (theme.fontSize || 56) + 'px';
+          verseEl.style.fontFamily = theme.fontFamily || 'system-ui, sans-serif';
+          verseEl.style.fontWeight = (theme.fontWeight || 600).toString();
+          verseEl.style.lineHeight = (theme.lineHeight || 1.35).toString();
+          verseEl.style.letterSpacing = (theme.letterSpacing || 0) + 'em';
+          verseEl.style.textShadow = shadow;
+          if (stroke) verseEl.style.webkitTextStroke = stroke;
           verseEl.textContent = payload.verse.text;
+
+          const refFontSize = theme.referenceFontSize > 0
+            ? theme.referenceFontSize
+            : Math.round((theme.fontSize || 56) * 0.4);
           const refEl = document.createElement('div');
           refEl.className = 'verse-reference';
-          refEl.style.color = theme.referenceColor;
-          refEl.style.fontSize = Math.round(theme.fontSize * 0.4) + 'px';
+          refEl.style.color = theme.referenceColor || '#f5c451';
+          refEl.style.fontSize = refFontSize + 'px';
+          refEl.style.fontFamily = theme.fontFamily || 'system-ui, sans-serif';
+          refEl.style.fontWeight = Math.min(theme.fontWeight || 600, 500).toString();
+          refEl.style.textAlign = theme.referenceAlign || theme.textAlign || 'center';
+          refEl.style.textShadow = shadow;
           refEl.textContent = payload.verse.reference;
-          stage.appendChild(verseEl);
-          stage.appendChild(refEl);
+
+          inner.appendChild(verseEl);
+          inner.appendChild(refEl);
         }
 
         render(${initialPayloadJson});
@@ -2488,9 +2816,10 @@ function commentsWindowState(message?: string): CommentsWindowState {
 }
 
 function currentCommentsView(): CommentsViewSnapshot | null {
-  if (commentsViewMode.kind === 'live') {
+  const mode = commentsViewSelection.current()
+  if (mode.kind === 'live') {
     return {
-      mode: commentsViewMode,
+      mode,
       snapshot: latestLiveCommentsSnapshot ?? {
         providers: [],
         messages: [],
@@ -2500,20 +2829,14 @@ function currentCommentsView(): CommentsViewSnapshot | null {
       latestSendOperation: latestLiveCommentsSendOperation
     }
   }
-  const snapshot = commentsHistorySnapshots.get(commentsViewMode.sessionId) ?? null
-  return snapshot
-    ? {
-        mode: commentsViewMode,
-        snapshot,
-        latestSendOperation: commentsHistorySendOperations.get(commentsViewMode.sessionId)
-      }
-    : null
+  const cached = commentsHistoryCache.get(mode.sessionId)
+  return cached ? { ...cached, mode } : null
 }
 
 function assertLiveCommentsCommandSession(sessionId: unknown): asserts sessionId is string {
   if (
     !liveCommentsCommandAllowed({
-      mode: commentsViewMode,
+      mode: commentsViewSelection.current(),
       liveSessionId: latestLiveCommentsSnapshot?.sessionId,
       commandSessionId: typeof sessionId === 'string' ? sessionId : undefined
     })
@@ -2543,18 +2866,18 @@ function cacheCommentsView(view: CommentsViewSnapshot): void {
         : undefined
     }
   } else {
-    commentsHistorySnapshots.set(view.mode.sessionId, view.snapshot)
-    if (view.latestSendOperation) {
-      commentsHistorySendOperations.set(
-        view.mode.sessionId,
-        reconcileCommentsSendOperation(
-          commentsHistorySendOperations.get(view.mode.sessionId),
-          view.latestSendOperation
-        )
-      )
-    } else {
-      commentsHistorySendOperations.delete(view.mode.sessionId)
-    }
+    const existing = commentsHistoryCache.peek(view.mode.sessionId)
+    const selectedMode = commentsViewSelection.current()
+    commentsHistoryCache.put(
+      {
+        ...view,
+        mode: view.mode,
+        latestSendOperation: view.latestSendOperation
+          ? reconcileCommentsSendOperation(existing?.latestSendOperation, view.latestSendOperation)
+          : undefined
+      },
+      selectedMode.kind === 'history' ? selectedMode.sessionId : undefined
+    )
   }
 }
 
@@ -2566,14 +2889,58 @@ function cacheCommentsSendResult(operation: CommentsSendOperation): 'live' | 'hi
     )
     return 'live'
   }
-  commentsHistorySendOperations.set(
-    operation.sessionId,
-    reconcileCommentsSendOperation(
-      commentsHistorySendOperations.get(operation.sessionId),
-      operation
+  const history = commentsHistoryCache.peek(operation.sessionId)
+  if (history) {
+    const selectedMode = commentsViewSelection.current()
+    commentsHistoryCache.put(
+      {
+        ...history,
+        latestSendOperation: reconcileCommentsSendOperation(history.latestSendOperation, operation)
+      },
+      selectedMode.kind === 'history' ? selectedMode.sessionId : undefined
     )
-  )
+  }
   return 'history'
+}
+
+async function loadCommentsHistoryView(mode: Extract<CommentsViewMode, { kind: 'history' }>) {
+  const maxMessages = 500
+  let messages: LiveChatMessage[] = []
+  let cursor: string | undefined
+  do {
+    const page = await requestBackendAdmin<SessionCommentsPage>('sessions.comments.list', {
+      sessionId: mode.sessionId,
+      cursor,
+      limit: Math.min(200, maxMessages - messages.length)
+    })
+    messages = [...page.messages, ...messages].slice(-maxMessages)
+    cursor = page.nextCursor
+  } while (cursor && messages.length < maxMessages)
+
+  const latestSendOperation = await requestBackendAdmin<CommentsSendOperation | null>(
+    'liveChat.sendOperations.latest',
+    { sessionId: mode.sessionId }
+  ).catch(() => null)
+  return {
+    mode,
+    snapshot: {
+      sessionId: mode.sessionId,
+      providers: [],
+      messages,
+      unreadCount: messages.length,
+      updatedAt: new Date().toISOString()
+    },
+    latestSendOperation: latestSendOperation ?? undefined
+  } satisfies HistoryCommentsView
+}
+
+async function selectCommentsViewMode(mode: CommentsViewMode): Promise<boolean> {
+  return prepareAndSelectCommentsView(
+    commentsViewSelection,
+    commentsHistoryCache,
+    mode,
+    loadCommentsHistoryView
+  )
 }
 
 function emitCommentsView(): void {
@@ -4266,6 +4633,7 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
         let frames = 0;
         let blankFrames = 0;
         let liveLayerCount = 0;
+        let proofTransportRateBaseline = null;
         let proofMeasurementEpoch = createNativePreviewProofMeasurementEpoch(
           performance.now(),
           blankFrames,
@@ -4449,6 +4817,7 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
             const abortController = new AbortController();
             poller.abortController = abortController;
             try {
+              markProofPollerRequestStarted(poller);
               const response = await fetch(frameRequestUrl(url, poller), {
                 cache: 'no-store',
                 signal: abortController.signal
@@ -4459,6 +4828,7 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
               const cursor = responseFrameCursor(response);
               if (response.status === 204) {
                 markProofPollerTransportSuccess(poller, performance.now());
+                markProofPollerNotModified(poller);
                 if (cursor) {
                   poller.generation = cursor.generation;
                   poller.sequence = cursor.sequence;
@@ -4498,6 +4868,13 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
                 throw new Error('Preview frame decoded without any visible pixels.');
               }
               presentProofPollerFrame(poller, objectUrl);
+              markProofPollerFrameDecoded(
+                poller,
+                blob.size,
+                next.naturalWidth,
+                next.naturalHeight,
+                performance.now()
+              );
               if (cursor) {
                 poller.generation = cursor.generation;
                 poller.sequence = cursor.sequence;
@@ -4755,6 +5132,16 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
             const healthySourceTransportCount = [...pollers.values()].filter((poller) =>
               proofPollerTransportIsFresh(poller, measuredAt, sourceFreshnessBudgetMs)
             ).length;
+            const transportTotals = proofPollerTransportTotals(pollers);
+            const transportBaseline = proofTransportRateBaseline;
+            proofTransportRateBaseline = { at: measuredAt, ...transportTotals };
+            const transportElapsedMs = transportBaseline
+              ? Math.max(1, measuredAt - transportBaseline.at)
+              : null;
+            const transportRate = (current, previous) =>
+              transportElapsedMs === null
+                ? null
+                : Math.max(0, current - previous) / transportElapsedMs * 1000;
             return {
               frames,
               measuredFps: measurement.measuredFps,
@@ -4788,6 +5175,20 @@ function nativePreviewSurfaceHtml(initialScene: PreviewSurfaceSceneState | null)
               framePollingSuppressed,
               framePollingIntervalMs,
               framePollingMaxWidth,
+              proofTransportRequestCount: transportTotals.requestCount,
+              proofTransportNotModifiedCount: transportTotals.notModifiedCount,
+              proofTransportBytesReceived: transportTotals.bytesReceived,
+              proofTransportDecodedFrames: transportTotals.decodedFrames,
+              proofTransportRequestsPerSecond: transportBaseline
+                ? transportRate(transportTotals.requestCount, transportBaseline.requestCount)
+                : null,
+              proofTransportBytesPerSecond: transportBaseline
+                ? transportRate(transportTotals.bytesReceived, transportBaseline.bytesReceived)
+                : null,
+              proofTransportDecodedFramesPerSecond: transportBaseline
+                ? transportRate(transportTotals.decodedFrames, transportBaseline.decodedFrames)
+                : null,
+              proofSourceDimensions: transportTotals.sourceDimensions,
               proofSurfaceSuspended,
               sourcePixelsPresent: liveLayerCount > 0,
               blankFrames: measurement.blankFrames,
@@ -4866,6 +5267,10 @@ async function createNativePreviewSurfaceWindow(generation: number): Promise<voi
     })
     nativePreviewSurfaceWindow = surfaceWindow
     surfaceWindow.setIgnoreMouseEvents(true)
+    // Geometry changes re-derive the DPR-aware frame width cap; moving across
+    // displays changes the scale factor even at constant logical size.
+    surfaceWindow.on('resize', scheduleNativePreviewProofPollingProfileResync)
+    surfaceWindow.on('move', scheduleNativePreviewProofPollingProfileResync)
     surfaceWindow.on('closed', () => {
       if (nativePreviewSurfaceWindow === surfaceWindow) {
         nativePreviewSurfaceWindow = null
@@ -5601,13 +6006,16 @@ async function presentNativePreviewSurfaceCompositor(
       compositorScene && compositorSceneIsCurrent
         ? `window.__videorcSetPreviewScene?.(${jsonForInlineScript(compositorScene)});`
         : ''
-    const statusJson = jsonForInlineScript(effectiveStatus)
+    // Compact present DTO (issue #157): only the fields the proof script
+    // consumes ride the per-present hot path; full diagnostics stay on the
+    // status channel. Present + metrics happen in ONE script round trip.
+    const statusJson = jsonForInlineScript(nativePreviewProofPresentStatus(effectiveStatus))
     if (nativePreviewSurfaceWindow === surfaceWindow && !surfaceWindow.isDestroyed()) {
-      await surfaceWindow.webContents.executeJavaScript(
-        `${sceneScript}window.__videorcSetCompositorStatus?.(${statusJson})`,
+      metrics = await surfaceWindow.webContents.executeJavaScript(
+        `${sceneScript}window.__videorcSetCompositorStatus?.(${statusJson});` +
+          `window.__videorcPresentNativePreviewNow?.() ?? new Promise((resolve) => requestAnimationFrame(() => resolve(window.__videorcNativePreviewMetrics?.() ?? null)))`,
         true
       )
-      metrics = await readNativePreviewSurfaceMetricsAfterPaint()
     }
   }
   if (!nativePreviewPresentationAllowedForGeneration(generation)) {
@@ -5632,6 +6040,12 @@ async function presentNativePreviewSurfaceCompositor(
   const freshSourceLayerCount = finiteMetric(metrics?.freshSourceLayerCount) ?? 0
   const sourcePollerCount = finiteMetric(metrics?.sourcePollerCount) ?? 0
   const sourceFrameAgeMs = finiteMetric(metrics?.sourceFrameAgeMs)
+  const proofTransportRequestsPerSecond = finiteMetric(metrics?.proofTransportRequestsPerSecond)
+  const proofTransportBytesPerSecond = finiteMetric(metrics?.proofTransportBytesPerSecond)
+  const proofTransportDecodedFramesPerSecond = finiteMetric(
+    metrics?.proofTransportDecodedFramesPerSecond
+  )
+  const proofSourceDimensions = proofSourceDimensionMetrics(metrics?.proofSourceDimensions)
   nativePreviewSurfaceStatus = {
     ...nativePreviewSurfaceStatus,
     ...nativePreviewRendererTimingStatusFields(effectiveStatus),
@@ -5653,6 +6067,10 @@ async function presentNativePreviewSurfaceCompositor(
     presentFps,
     intervalP95Ms,
     intervalP99Ms,
+    proofTransportRequestsPerSecond,
+    proofTransportBytesPerSecond,
+    proofTransportDecodedFramesPerSecond,
+    proofSourceDimensions,
     framePollingSuppressed: nativePreviewProofPollingIsSuppressed(),
     sourcePixelsPresent: freshSourceLayerCount > 0,
     nativePreviewHostKind: 'proof-surface',
@@ -6056,13 +6474,50 @@ async function setNativePreviewSurfaceFramePollingSuppressed(
   return nativePreviewSurfaceStatus
 }
 
+// DPR-aware cap input (issue #157): the proof surface can never display more
+// source pixels than its own content width × display scale, so that is the
+// width the frame requests are bounded by (quantized + floored in shared
+// nativePreviewProofPollingMaxWidth).
+function nativePreviewProofSurfacePixelWidth(surfaceWindow: BrowserWindow): number | undefined {
+  try {
+    const contentWidth = surfaceWindow.getContentBounds().width
+    if (!Number.isFinite(contentWidth) || contentWidth <= 0) {
+      return undefined
+    }
+    const scaleFactor = screen.getDisplayMatching(surfaceWindow.getBounds()).scaleFactor
+    return contentWidth * (Number.isFinite(scaleFactor) && scaleFactor > 0 ? scaleFactor : 1)
+  } catch {
+    return undefined
+  }
+}
+
+let nativePreviewProofPollingResyncTimer: NodeJS.Timeout | null = null
+
+// Trailing debounce: bounds changes arrive in bursts (drag-resize, slot
+// follow); the profile key dedupes identical results, this just keeps the
+// script round trips off the resize hot path.
+function scheduleNativePreviewProofPollingProfileResync(): void {
+  if (nativePreviewProofPollingResyncTimer) {
+    return
+  }
+  nativePreviewProofPollingResyncTimer = setTimeout(() => {
+    nativePreviewProofPollingResyncTimer = null
+    void syncNativePreviewProofPollingProfile()
+  }, 150)
+}
+
 async function syncNativePreviewProofPollingProfile(): Promise<void> {
-  const profile = nativePreviewProofPollingProfile(nativePreviewProofPollingRecordingActive)
   const surfaceWindow = nativePreviewSurfaceWindow
   if (!surfaceWindow || surfaceWindow.isDestroyed()) {
     nativePreviewAppliedProofPollingProfile = null
     return
   }
+  const currentProfile = (): NativePreviewProofPollingProfile =>
+    nativePreviewProofPollingProfile(
+      nativePreviewProofPollingRecordingActive,
+      nativePreviewProofSurfacePixelWidth(surfaceWindow)
+    )
+  const profile = currentProfile()
   const profileKey = nativePreviewProofPollingProfileKey(surfaceWindow.id, profile)
   if (nativePreviewAppliedProofPollingProfile === profileKey) {
     return
@@ -6071,11 +6526,7 @@ async function syncNativePreviewProofPollingProfile(): Promise<void> {
   await waitForNativePreviewSurfaceScript(surfaceWindow)
   if (
     requestSerial !== nativePreviewProofPollingProfileSerial ||
-    profileKey !==
-      nativePreviewProofPollingProfileKey(
-        surfaceWindow.id,
-        nativePreviewProofPollingProfile(nativePreviewProofPollingRecordingActive)
-      ) ||
+    profileKey !== nativePreviewProofPollingProfileKey(surfaceWindow.id, currentProfile()) ||
     surfaceWindow.isDestroyed() ||
     nativePreviewSurfaceWindow !== surfaceWindow
   ) {
@@ -6088,11 +6539,7 @@ async function syncNativePreviewProofPollingProfile(): Promise<void> {
   )
   if (
     requestSerial === nativePreviewProofPollingProfileSerial &&
-    profileKey ===
-      nativePreviewProofPollingProfileKey(
-        surfaceWindow.id,
-        nativePreviewProofPollingProfile(nativePreviewProofPollingRecordingActive)
-      ) &&
+    profileKey === nativePreviewProofPollingProfileKey(surfaceWindow.id, currentProfile()) &&
     !surfaceWindow.isDestroyed() &&
     nativePreviewSurfaceWindow === surfaceWindow
   ) {
@@ -6185,6 +6632,23 @@ async function readNativePreviewSurfaceMetricsAfterPaint(
 
 function finiteMetric(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+}
+
+function proofSourceDimensionMetrics(
+  value: unknown
+): Record<string, { width: number; height: number }> | undefined {
+  if (!value || typeof value !== 'object') {
+    return undefined
+  }
+  const dimensions: Record<string, { width: number; height: number }> = {}
+  for (const [id, entry] of Object.entries(value as Record<string, unknown>)) {
+    const width = finiteMetric((entry as { width?: unknown })?.width)
+    const height = finiteMetric((entry as { height?: unknown })?.height)
+    if (width !== undefined && height !== undefined) {
+      dimensions[id] = { width, height }
+    }
+  }
+  return Object.keys(dimensions).length > 0 ? dimensions : undefined
 }
 
 function proofSourceFrameTotal(metrics: unknown): number {
@@ -6673,7 +7137,7 @@ function createNativePreviewHelperProcessDriverConfig():
   const ffmpegBinDir = resolvePackagedFfmpegBinDir()
   const pathEntries = [ffmpegBinDir, cargoBinDir, process.env.PATH].filter(Boolean)
   const env = {
-    ...process.env,
+    ...sanitizedChildProcessEnvironment(process.env),
     ...devCargoEnvOverrides(),
     PATH: pathEntries.join(delimiter)
   }
@@ -6991,11 +7455,16 @@ function withProcessRegistryLock<T>(operation: () => T): T {
   }
 }
 
+function persistOwnedProcess(pid: number, label: string): void {
+  withProcessRegistryLock(() => processRegistry().record(pid, label))
+}
+
 function recordOwnedProcess(pid: number, label: string): void {
   try {
-    withProcessRegistryLock(() => processRegistry().record(pid, label))
+    persistOwnedProcess(pid, label)
   } catch (error) {
-    logBackend('warn', `Could not record ${label} process ${pid}: ${errorMessage(error)}`)
+    logBackend('error', `Could not record ${label} process ${pid}: ${errorMessage(error)}`)
+    throw error
   }
 }
 
@@ -7031,26 +7500,61 @@ function shouldDisableBackendReap(): boolean {
   )
 }
 
-function recordBackendOwnedProcess(pid: unknown, label: string): void {
+function recordBackendOwnedProcess(runtime: BackendRuntime, pid: unknown, label: string): void {
   if (!validOwnedProcessPid(pid)) {
     return
   }
-  backendOwnedProcessPids.add(pid)
-  recordOwnedProcess(pid, label)
+  claimDurableBackendPid(backendRuntimeOwner, runtime, pid, {
+    persist: () => persistOwnedProcess(pid, label),
+    terminate: () => terminateBackendRuntimeAfterOwnershipFailure(runtime, pid)
+  })
 }
 
-function removeBackendOwnedProcesses(): void {
-  for (const pid of backendOwnedProcessPids) {
-    removeOwnedProcess(pid)
+function terminateBackendRuntimeAfterOwnershipFailure(runtime: BackendRuntime, pid: number): void {
+  if (backendRuntimeOwner.isCurrent(runtime)) {
+    clearBackendConnectionState()
+    sendToWindows('backend:lifecycle', { state: 'lost' })
   }
-  backendOwnedProcessPids.clear()
+  requestBackendRuntimeTermination(runtime, pid, {
+    runtimePid: runtime.process.pid,
+    signalExactPid: (exactPid) => {
+      try {
+        process.kill(exactPid, 'SIGKILL')
+        return true
+      } catch (error) {
+        if (processErrorCode(error) === 'ESRCH') {
+          return true
+        }
+        throw error
+      }
+    },
+    signalRuntimeProcess: (child) => child.kill('SIGKILL')
+  })
 }
 
-function recordBackendRuntimeProcess(connection: BackendConnection): void {
+function processErrorCode(error: unknown): string | undefined {
+  return error && typeof error === 'object' && 'code' in error
+    ? (error as { code?: string }).code
+    : undefined
+}
+
+function recordedBackendProcessMayStillBeOwned(pid: number): boolean {
+  try {
+    return withProcessRegistryLock(() => processRegistry().probeRecordedOwnership(pid) !== 'gone')
+  } catch (error) {
+    logBackend(
+      'warn',
+      `Could not reconcile durable identity for backend pid ${pid}; retaining ownership: ${errorMessage(error)}`
+    )
+    return true
+  }
+}
+
+function recordBackendRuntimeProcess(runtime: BackendRuntime, connection: BackendConnection): void {
   if (!validOwnedProcessPid(connection.pid)) {
     return
   }
-  recordBackendOwnedProcess(connection.pid, 'videorc-backend')
+  recordBackendOwnedProcess(runtime, connection.pid, 'videorc-backend')
   const parent = validProcessPid(connection.parentPid) ? ` parentPid=${connection.parentPid}` : ''
   logBackend('info', `Backend runtime pid=${connection.pid}${parent}`)
 }
@@ -7164,23 +7668,39 @@ function resolveBackendPermissionTargetPath(): string {
 function resolvePackagedFfmpegBinDir(): string | null {
   // Dev mode on Windows: use the pinned vendor FFmpeg from
   // `pnpm ffmpeg:fetch:windows` when present, so development does not depend
-  // on a system-wide ffmpeg install. macOS dev keeps resolving via PATH.
+  // on a system-wide ffmpeg install.
   const binDir = app.isPackaged
     ? join(process.resourcesPath, 'ffmpeg', 'bin')
     : process.platform === 'win32'
       ? join(workspaceRoot(), 'vendor', 'ffmpeg', 'windows-x64', 'bin')
       : null
-  if (!binDir) {
+  if (binDir) {
+    const binary = join(binDir, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
+    if (existsSync(binary)) {
+      return binDir
+    }
+  }
+  if (app.isPackaged || process.platform === 'win32') {
     return null
   }
-  const binary = join(binDir, process.platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg')
-  return existsSync(binary) ? binDir : null
+  // macOS dev: the backend inherits whatever PATH the launcher had — Finder,
+  // IDE, and agent launches usually lack Homebrew's prefix, which surfaced as
+  // "FFmpeg device probe failed: Could not run ffmpeg (os error 2)". Prefer
+  // the repo's own vendored build, then the standard Homebrew locations.
+  const vendored = join(workspaceRoot(), 'vendor', 'ffmpeg', 'current', 'bin')
+  const homebrew = process.arch === 'arm64' ? '/opt/homebrew/bin' : '/usr/local/bin'
+  for (const dir of [vendored, homebrew]) {
+    if (existsSync(join(dir, 'ffmpeg'))) {
+      return dir
+    }
+  }
+  return null
 }
 
 // Single-backend policy: reap only children a previous Zemara launch recorded.
 // Never scan command lines; substring process matching can kill cargo builds,
 // editors, or unrelated processes.
-function reapStaleBackendProcesses(): void {
+function reapStaleBackendProcesses(): boolean {
   let stale: ReturnType<OwnedProcessRegistry['reapStale']>
   try {
     stale = withProcessRegistryLock(() =>
@@ -7190,18 +7710,68 @@ function reapStaleBackendProcesses(): void {
     )
   } catch (error) {
     logBackend('warn', `Could not reap stale owned backend processes: ${errorMessage(error)}`)
-    return
+    return false
   }
-  if (stale.length > 0) {
+  if (stale.attempted.length > 0) {
     logBackend(
       'warn',
-      `Reaping ${stale.length} stale owned backend process(es): ${stale.map((record) => `${record.label}:${record.pid}`).join(', ')}`
+      `Confirmed ${stale.confirmedDead.length} stale owned process record(s) dead after reaping ${stale.attempted.length} live pid(s): ${stale.attempted.map((record) => `${record.label}:${record.pid}`).join(', ')}`
     )
   }
+  if (stale.identityMismatches.length > 0) {
+    logBackend(
+      'warn',
+      `Pruned ${stale.identityMismatches.length} stale owned process record(s) whose pid now belongs to a different process without signaling the current occupant: ${stale.identityMismatches.map((record) => `${record.label}:${record.pid}`).join(', ')}`
+    )
+  }
+  if (stale.unconfirmed.length > 0) {
+    logBackend(
+      'error',
+      `Refusing backend startup because owned pid(s) ${stale.unconfirmed.map((record) => record.pid).join(', ')} remain live or unprobeable.`
+    )
+    sendToWindows('backend:lifecycle', { state: 'lost' })
+    return false
+  }
+  return true
+}
+
+function reconcileUnconfirmedBackendRuntime(): boolean {
+  const runtime = backendRuntimeOwner.current()
+  if (!runtime || runtime.state !== 'shutdown-unconfirmed') {
+    return runtime === null
+  }
+
+  const settlement = settleBackendRuntimeExit(
+    backendRuntimeOwner,
+    runtime,
+    undefined,
+    recordedBackendProcessMayStillBeOwned
+  )
+  for (const pid of settlement.confirmedDead) {
+    removeOwnedProcess(pid)
+  }
+  if (!settlement.completed) {
+    logBackend(
+      'error',
+      `Refusing backend startup because generation ${runtime.generation} still owns live or unprobeable pid(s) ${settlement.stillLive.join(', ')}.`
+    )
+    sendToWindows('backend:lifecycle', { state: 'lost' })
+    return false
+  }
+
+  if (backendProcess === runtime.process) {
+    backendProcess = null
+  }
+  clearBackendConnectionState()
+  logBackend('info', `Backend generation ${runtime.generation} death is now exactly confirmed.`)
+  return true
 }
 
 function startBackend(): void {
-  if (backendProcess) {
+  if (backendRuntimeOwner.current()?.state === 'shutdown-unconfirmed') {
+    reconcileUnconfirmedBackendRuntime()
+  }
+  if (backendProcess || backendRuntimeOwner.current()) {
     return
   }
 
@@ -7264,13 +7834,67 @@ function cancelBackendRestart(): void {
   }
 }
 
-function startBackendWithRegistryLock(): void {
-  if (backendProcess) {
+function clearBackendConnectionState(): void {
+  backendConnection = null
+  backendAdminConnection = null
+  backendAuthorityReady = Promise.resolve()
+  mainResourceCapabilities.clear()
+  disconnectBackendEventSocket()
+}
+
+function finalizeBackendRuntimeExit(
+  runtime: BackendRuntime,
+  code: number | null,
+  signal: NodeJS.Signals | null
+): void {
+  const settlement = settleBackendRuntimeExit(
+    backendRuntimeOwner,
+    runtime,
+    validOwnedProcessPid(runtime.process.pid) ? runtime.process.pid : undefined,
+    recordedBackendProcessMayStillBeOwned
+  )
+  for (const pid of settlement.confirmedDead) {
+    removeOwnedProcess(pid)
+  }
+  if (settlement.stillLive.length > 0) {
+    logBackend(
+      settlement.completed ? 'warn' : 'error',
+      `Backend generation ${runtime.generation} exited while owned pid(s) ${settlement.stillLive.join(', ')} remain live; retaining exact ownership${settlement.completed ? ' ledger evidence for reaping' : ' and refusing replacement startup'}.`
+    )
+  }
+  if (!settlement.completed) {
+    if (backendProcess === runtime.process) {
+      backendProcess = null
+    }
+    clearBackendConnectionState()
+    sendToWindows('backend:lifecycle', { state: 'lost' })
     return
   }
-  backendOwnedProcessPids = new Set()
+  if (!settlement.wasCurrent) {
+    return
+  }
 
-  reapStaleBackendProcesses()
+  logBackend(
+    'warn',
+    `Backend generation ${runtime.generation} exited with code ${code ?? 'null'} and signal ${signal ?? 'null'}`
+  )
+  if (backendProcess === runtime.process) {
+    backendProcess = null
+  }
+  clearBackendConnectionState()
+  if (!settlement.wasIntentional) {
+    scheduleBackendRestart(code, signal)
+  }
+}
+
+function startBackendWithRegistryLock(): void {
+  if (backendProcess || backendRuntimeOwner.current()) {
+    return
+  }
+
+  if (!reapStaleBackendProcesses()) {
+    return
+  }
 
   const root = workspaceRoot()
   const cargoBinDir = join(homedir(), '.cargo', 'bin')
@@ -7285,10 +7909,10 @@ function startBackendWithRegistryLock(): void {
     logBackend('info', `Using bundled FFmpeg from ${ffmpegBinDir}`)
   }
   backendLastStartAt = Date.now()
-  backendProcess = spawn(command, args, {
+  const child = spawn(command, args, {
     cwd: root,
     env: {
-      ...process.env,
+      ...sanitizedChildProcessEnvironment(process.env),
       ...devCargoEnvOverrides(),
       // Full isolation or none: when app/user data dirs are overridden (smokes,
       // probes), the backend's sqlite + secrets must move with them instead of
@@ -7310,34 +7934,30 @@ function startBackendWithRegistryLock(): void {
       RUST_LOG: process.env.RUST_LOG ?? 'videorc_backend=info'
     }
   })
-  const backendPid = backendProcess.pid
-  recordBackendOwnedProcess(
-    backendPid,
-    app.isPackaged ? 'videorc-backend' : 'cargo-run-videorc-backend'
-  )
-
-  backendProcess.stdout.on('data', (chunk: Buffer) => handleBackendStdout(chunk.toString()))
-  backendProcess.stderr.on('data', (chunk: Buffer) => {
+  backendProcess = child
+  const runtime = backendRuntimeOwner.start(child)
+  let runtimeStdoutBuffer = ''
+  child.stdout.on('data', (chunk: Buffer) => {
+    runtimeStdoutBuffer = handleBackendStdout(chunk.toString(), runtime, runtimeStdoutBuffer)
+  })
+  child.stderr.on('data', (chunk: Buffer) => {
     for (const line of chunk.toString().split(/\r?\n/)) {
       if (line.trim()) {
         logBackend(inferBackendLogLevel(line), line.trim())
       }
     }
   })
-  backendProcess.on('error', (error) => {
+  child.on('error', (error) => {
     logBackend('error', `Backend process error: ${error.message}`)
   })
-  backendProcess.on('close', (code, signal) => {
-    removeBackendOwnedProcesses()
-    logBackend('warn', `Backend exited with code ${code ?? 'null'} and signal ${signal ?? 'null'}`)
-    backendProcess = null
-    backendConnection = null
-    backendAdminConnection = null
-    backendAuthorityReady = Promise.resolve()
-    mainResourceCapabilities.clear()
-    disconnectBackendEventSocket()
-    scheduleBackendRestart(code, signal)
+  child.on('close', (code, signal) => {
+    finalizeBackendRuntimeExit(runtime, code, signal)
   })
+  recordBackendOwnedProcess(
+    runtime,
+    child.pid,
+    app.isPackaged ? 'videorc-backend' : 'cargo-run-videorc-backend'
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -7601,8 +8221,10 @@ const MAIN_BACKEND_ADMIN_METHODS = new Set([
   'resource.admin.resolve_screen_path',
   'resource.admin.resolve_background_path',
   'preview.surface.take_native_host_commands',
+  'sessions.comments.list',
   'sessions.delete.resolve',
-  'sessions.delete.complete'
+  'sessions.delete.complete',
+  'liveChat.sendOperations.latest'
 ])
 
 async function requestBackendAdmin<T>(
@@ -7820,10 +8442,13 @@ function errorMessageText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function handleBackendStdout(text: string): void {
-  stdoutBuffer += text
-  const lines = stdoutBuffer.split(/\r?\n/)
-  stdoutBuffer = lines.pop() ?? ''
+function handleBackendStdout(text: string, runtime: BackendRuntime, bufferedText: string): string {
+  const lines = `${bufferedText}${text}`.split(/\r?\n/)
+  const remaining = lines.pop() ?? ''
+
+  if (!backendRuntimeOwner.isCurrent(runtime) || runtime.state !== 'active') {
+    return remaining
+  }
 
   for (const line of lines) {
     const trimmed = line.trim()
@@ -7837,7 +8462,7 @@ function handleBackendStdout(text: string): void {
         backendConnection = bootstrap.renderer
         backendAdminConnection = bootstrap.admin
         logBackend('info', `Backend ready on ${backendConnection.host}:${backendConnection.port}`)
-        recordBackendRuntimeProcess(backendConnection)
+        recordBackendRuntimeProcess(runtime, backendConnection)
         if (process.env.VIDEORC_SMOKE_PRINT_BACKEND_READY === '1') {
           // The admin credential is private bootstrap authority. Even debug
           // smoke output receives only the renderer-scoped connection.
@@ -7854,6 +8479,8 @@ function handleBackendStdout(text: string): void {
         })
         void backendAuthorityReady.then(() => {
           if (
+            backendRuntimeOwner.isCurrent(runtime) &&
+            runtime.state === 'active' &&
             backendConnection === rendererConnection &&
             backendAdminConnection === adminConnection
           ) {
@@ -7870,6 +8497,8 @@ function handleBackendStdout(text: string): void {
 
     logBackend('info', trimmed)
   }
+
+  return remaining
 }
 
 function logBackend(level: BackendLogEvent['level'], message: string): void {
@@ -7897,16 +8526,34 @@ async function primeScreenCapturePermission(): Promise<void> {
 
   try {
     const info = await runtimeInfo()
-    const status = systemPreferences.getMediaAccessStatus('screen')
+    // The HONEST status (never-asked vs denied): Electron's raw read reports
+    // 'denied' for both, which used to route every first use into the
+    // "open settings yourself" branch without ever asking.
+    const status = readScreenAccessStatus()
     if (status === 'granted') {
       return
     }
 
     if (status === 'not-determined') {
-      await desktopCapturer.getSources({
-        types: ['screen'],
-        thumbnailSize: { width: 0, height: 0 }
-      })
+      // TCC suppresses prompts from an inactive app — bring Zemara forward
+      // before asking, the same trick the camera/mic primer relies on.
+      try {
+        app.focus({ steal: true })
+      } catch {
+        app.show()
+      }
+      // The N-API module only PREFLIGHTS on macOS 11+ (its prompt path is a
+      // pre-macOS-11 fallback) — it can never raise the system dialog. Keep it
+      // for prompted-tracking, but the real ask ALWAYS goes through the
+      // backend one-shot helper: the only code path that actually calls
+      // CGRequestScreenCaptureAccess as this app.
+      try {
+        hasScreenCapturePermission()
+      } catch {
+        // Tracking only — the helper below is the authoritative ask.
+      }
+      await runScreenAccessRequestHelper()
+      markScreenAccessAsked()
       const nextStatus = systemPreferences.getMediaAccessStatus('screen')
       logBackend(
         nextStatus === 'granted' ? 'info' : 'warn',
@@ -7921,6 +8568,74 @@ async function primeScreenCapturePermission(): Promise<void> {
     )
   } catch (error) {
     logBackend('warn', `Could not request Screen Recording permission: ${errorMessage(error)}`)
+  }
+}
+
+// Runs `videorc-backend --request-screen-access` and waits for it to exit.
+// The CGRequestScreenCaptureAccess prompt is asynchronous on Apple's side —
+// the helper exits with the CURRENT access (0 = granted, 1 = not yet), so a
+// non-zero exit is expected when the user has not decided yet; it is not an
+// error. A missing helper binary or a hang is bounded and logged by the
+// caller's catch.
+function runScreenAccessRequestHelper(): Promise<void> {
+  return new Promise((resolve) => {
+    const helperPath = resolveBackendPermissionTargetPath()
+    const child = spawn(helperPath, ['--request-screen-access'], { stdio: 'ignore' })
+    const finish = (): void => {
+      clearTimeout(timer)
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      resolve()
+    }, 10_000)
+    child.on('error', finish)
+    child.on('exit', finish)
+  })
+}
+
+// Camera + microphone are requested up front — BEFORE the backend process
+// spawns — so the macOS prompt is attributed to the Zemara host and the
+// backend (its child) inherits the grant through TCC's responsible-process
+// rule. Before this primer, the first backend-side AVFoundation read saw
+// NotDetermined and either never prompted ("Camera permission has not been
+// granted yet" / black frames) or prompted as videorc-backend itself. On
+// Windows there is no OS-level ask; per-device privacy toggles apply, and
+// the status chips in Settings carry the honest state.
+async function primeCameraMicrophonePermissions(): Promise<void> {
+  if (!isMac) {
+    return
+  }
+  // TCC suppresses prompts from an inactive app — the primer used to run
+  // before the window existed and askForMediaAccess resolved `false` without
+  // ever showing the dialog. Bring the app forward first (best-effort).
+  try {
+    app.focus({ steal: true })
+  } catch {
+    app.show()
+  }
+  for (const pane of ['microphone', 'camera'] as const) {
+    const label = pane === 'camera' ? 'Camera' : 'Microphone'
+    try {
+      const status = systemPreferences.getMediaAccessStatus(pane)
+      if (status === 'granted') {
+        continue
+      }
+      if (status === 'not-determined') {
+        const granted = await systemPreferences.askForMediaAccess(pane)
+        logBackend(
+          granted ? 'info' : 'warn',
+          `${label} permission request resolved as ${granted ? 'granted' : 'denied'} at startup.`
+        )
+        continue
+      }
+      logBackend(
+        'warn',
+        `${label} permission is ${status}. Open macOS ${label} privacy settings, enable Zemara, then quit and relaunch.`
+      )
+    } catch (error) {
+      logBackend('warn', `Could not request ${label} permission at startup: ${errorMessage(error)}`)
+    }
   }
 }
 
@@ -8298,7 +9013,7 @@ async function runSmokePreviewMotionCommand(
     const sceneScript = finalScene
       ? `window.__videorcSetPreviewScene?.(${jsonForInlineScript(finalScene)});`
       : ''
-    const statusScript = `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(finalStatus)});`
+    const statusScript = `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(nativePreviewProofPresentStatus(finalStatus))});`
     const result = await nativePreviewSurfaceWindow.webContents.executeJavaScript(
       `${sceneScript}${statusScript}window.__videorcPresentNativePreviewNow?.();(() => {
         const layer = document.querySelector('[data-layer-id="source:camera"]');
@@ -8331,7 +9046,7 @@ async function runSmokePreviewMotionCommand(
     const finalStatus = smokeCompositorStatusFromSceneParams(params)
     const status = await updateNativePreviewSurfaceCompositor(finalStatus)
     const result = await nativePreviewSurfaceWindow.webContents.executeJavaScript(
-      `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(finalStatus)});window.__videorcPresentNativePreviewNow?.();(() => {
+      `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(nativePreviewProofPresentStatus(finalStatus))});window.__videorcPresentNativePreviewNow?.();(() => {
         const background = document.querySelector('[data-layer-id="background:builtin-bg-01"]');
         const screen = document.querySelector('[data-layer-id="source:test-pattern"]');
         const image = background?.querySelector('img');
@@ -8383,7 +9098,7 @@ async function runSmokePreviewMotionCommand(
       const sceneScript = finalScene
         ? `window.__videorcSetPreviewScene?.(${jsonForInlineScript(finalScene)});`
         : ''
-      const statusScript = `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(finalStatus)});`
+      const statusScript = `window.__videorcSetCompositorStatus?.(${jsonForInlineScript(nativePreviewProofPresentStatus(finalStatus))});`
       metrics = await surfaceWindow.webContents.executeJavaScript(
         `${sceneScript}${statusScript}window.__videorcPresentNativePreviewNow?.();window.__videorcNativePreviewMetrics?.() ?? null`,
         true
@@ -8433,6 +9148,16 @@ async function runSmokePreviewMotionCommand(
           true
         )
       : null
+    if (measuringProofSurface) {
+      // Keep the status sampled by smoke diagnostics on the same epoch as the
+      // proof host. Otherwise a pre-reset startup percentile can be observed
+      // after the steady-state measurement timestamp and fail the performance
+      // gate even though the direct proof-host measurement is healthy.
+      nativePreviewSurfaceStatus = {
+        ...resetNativePreviewProofMeasurementStatus(nativePreviewSurfaceStatus),
+        updatedAt: new Date().toISOString()
+      }
+    }
     const measurementStartedAtMs = Date.now()
     await new Promise((resolveMeasure) => setTimeout(resolveMeasure, durationMs))
     if (nativePreviewSurfaceStatusIsRealSurface(nativePreviewSurfaceStatus)) {
@@ -8778,7 +9503,7 @@ async function runSmokePreviewMotionCommand(
       snapshot,
       latestSendOperation: params.latestSendOperation as CommentsSendOperation | undefined
     })
-    commentsViewMode = mode
+    commentsViewSelection.set(mode)
     emitCommentsView()
     return currentCommentsView()
   }
@@ -8788,8 +9513,9 @@ async function runSmokePreviewMotionCommand(
     if (!mode || (mode.kind !== 'live' && mode.kind !== 'history')) {
       throw new Error('Comments view mode must be live or history.')
     }
-    commentsViewMode = mode
-    emitCommentsView()
+    if (await selectCommentsViewMode(mode)) {
+      emitCommentsView()
+    }
     return currentCommentsView()
   }
 
@@ -8838,7 +9564,7 @@ async function runSmokePreviewMotionCommand(
       routedTo,
       currentView: currentCommentsView(),
       liveOperation: latestLiveCommentsSendOperation,
-      historyOperation: commentsHistorySendOperations.get(operation.sessionId)
+      historyOperation: commentsHistoryCache.peek(operation.sessionId)?.latestSendOperation
     }
   }
 
@@ -10130,7 +10856,7 @@ function inferBackendLogLevel(line: string): BackendLogEvent['level'] {
   return 'info'
 }
 
-async function stopBackend(): Promise<void> {
+async function stopBackend(): Promise<BackendShutdownResult> {
   destroyNativePreviewSurface()
   smokePreviewMotionServer?.close()
   smokePreviewMotionServer = null
@@ -10138,23 +10864,26 @@ async function stopBackend(): Promise<void> {
   youtubeBridgeServer = null
   youtubeBridgeServerPort = null
   const child = backendProcess
-  if (!child) {
-    return
+  const runtime = backendRuntimeOwner.current()
+  if (!child || !runtime || runtime.process !== child) {
+    return 'skipped'
   }
 
+  backendRuntimeOwner.beginShutdown(runtime)
   const result = await stopBackendProcess(child)
   if (result === 'timed-out') {
-    logBackend('warn', 'Backend shutdown timed out; continuing app quit after SIGKILL.')
+    backendRuntimeOwner.markShutdownUnconfirmed(runtime)
+    clearBackendConnectionState()
+    logBackend(
+      'error',
+      `Backend generation ${runtime.generation} shutdown timed out after SIGKILL; retaining exact ownership and refusing replacement startup.`
+    )
+    sendToWindows('backend:lifecycle', { state: 'lost' })
+    return result
   }
-  if (backendProcess === child) {
-    removeBackendOwnedProcesses()
-    backendProcess = null
-    backendConnection = null
-    backendAdminConnection = null
-    backendAuthorityReady = Promise.resolve()
-    mainResourceCapabilities.clear()
-    disconnectBackendEventSocket()
-  }
+
+  finalizeBackendRuntimeExit(runtime, child.exitCode, child.signalCode)
+  return result
 }
 
 async function openSystemPermissions(pane: SystemPermissionPane = 'privacy'): Promise<void> {
@@ -10225,7 +10954,10 @@ async function restartBackend(reason: string): Promise<void> {
 
   backendRestartInProgress = (async () => {
     logBackend('info', reason)
-    await stopBackend()
+    const result = await stopBackend()
+    if (result === 'timed-out') {
+      throw new Error('Backend restart was refused because shutdown could not be confirmed.')
+    }
     if (!appIsQuitting) {
       startBackend()
     }
@@ -10426,6 +11158,14 @@ async function trashSessionDeletion(operationId: unknown): Promise<{
     operationId,
     failedPaths
   })
+  if (completion.deleted) {
+    commentsHistoryCache.delete(operation.sessionId)
+    const selectedMode = commentsViewSelection.current()
+    if (selectedMode.kind === 'history' && selectedMode.sessionId === operation.sessionId) {
+      commentsViewSelection.set({ kind: 'live' })
+      emitCommentsView()
+    }
+  }
   return { deleted: completion.deleted, failedCount: failedPaths.length }
 }
 
@@ -11177,9 +11917,68 @@ app.whenReady().then(async () => {
   // workspace size once the real app is ready to appear — see GATE_WINDOW_SIZE.
   secureIpcHandle('app:set-window-gated', (_event, gated: boolean) => {
     if (!mainWindow || mainWindow.isDestroyed()) return
-    const { width, height } = gated ? GATE_WINDOW_SIZE : computeLaunchWindowSize()
+    if (gated && auxiliaryWindowsRestored) {
+      // Re-gating after a previous completion (a TERMS_VERSION bump re-prompts
+      // existing users): pull every detached window back down so the gate
+      // stands alone again; they re-restore when the gate clears.
+      auxiliaryWindowsRestored = false
+      closePreviewWindow()
+      closeNotesWindow()
+      closeCommentsWindow()
+      closeCaptionsWindow()
+    }
+    mainWindowGated = gated
+    const workArea = screen.getPrimaryDisplay().workAreaSize
+    mainWindow.setMinimumSize(gated ? Math.min(GATE_WINDOW_SIZE.width, workArea.width) : 960, 660)
+    const { width, height } = gated
+      ? {
+          width: Math.min(GATE_WINDOW_SIZE.width, workArea.width),
+          height: Math.min(GATE_WINDOW_SIZE.height, workArea.height)
+        }
+      : computeLaunchWindowSize()
     mainWindow.setSize(width, height, false)
     mainWindow.center()
+    if (!gated) {
+      markFirstRunCompleted()
+      // First-run gate just completed: start the backend (deferred at boot so
+      // no device access could prompt before the permissions step) and let
+      // the remembered detached windows appear.
+      startBackend()
+      restoreAuxiliaryWindowsOnLaunch()
+    }
+  })
+  // Screen Recording status + explicit ask for the first-run permissions
+  // step. The status read is a preflight (never prompts); the request runs
+  // the same ScreenCaptureKit enumeration the boot primer uses, so the
+  // system prompt appears only when the user clicks Enable on the
+  // permissions screen — never at app boot.
+  secureIpcHandle('app:get-screen-access-status', (): MediaAccessStatus => {
+    if (!isMac) {
+      // Windows has no per-app screen-capture permission.
+      return 'granted'
+    }
+    return readScreenAccessStatus()
+  })
+  secureIpcHandle('app:request-screen-access', async (): Promise<MediaAccessStatus> => {
+    if (!isMac) {
+      return 'granted'
+    }
+    // Record the ask BEFORE priming: even if the operator dismisses the macOS
+    // prompt, the honest state afterwards is "asked, not granted" — never
+    // back to "never asked".
+    markScreenAccessAsked()
+    await primeScreenCapturePermission()
+    const status = readScreenAccessStatus()
+    if (status !== 'granted') {
+      // macOS cannot re-prompt once asked: land the operator exactly on the
+      // Screen Recording pane so enabling Zemara is one click away.
+      await shell
+        .openExternal(permissionUrlForPane('screen-recording'))
+        .catch((error: unknown) =>
+          logBackend('warn', `Could not open Screen Recording settings: ${errorMessage(error)}`)
+        )
+    }
+    return status
   })
   secureIpcHandle('app:set-native-theme', (_event, theme: string) => {
     nativeTheme.themeSource = theme === 'light' ? 'light' : 'dark'
@@ -11231,6 +12030,13 @@ app.whenReady().then(async () => {
     }
     return previewWindowState()
   })
+  secureIpcHandle(
+    'global-shortcuts:set',
+    (
+      _event,
+      shortcuts: { recordToggle?: string; streamToggle?: string; micToggle?: string } | undefined
+    ) => setGlobalShortcuts(shortcuts ?? {})
+  )
   secureIpcHandle('notes-window:open', () => openNotesWindow())
   secureIpcHandle('notes-window:close', () => closeNotesWindow())
   secureIpcHandle('notes-window:get-state', () => notesWindowState())
@@ -11270,10 +12076,11 @@ app.whenReady().then(async () => {
       return currentCommentsView()
     }
     cacheCommentsView(view)
-    if (commentsViewMode.kind === view.mode.kind) {
+    const selectedMode = commentsViewSelection.current()
+    if (selectedMode.kind === view.mode.kind) {
       if (
         view.mode.kind === 'live' ||
-        (commentsViewMode.kind === 'history' && commentsViewMode.sessionId === view.mode.sessionId)
+        (selectedMode.kind === 'history' && selectedMode.sessionId === view.mode.sessionId)
       ) {
         emitCommentsView()
       }
@@ -11281,7 +12088,7 @@ app.whenReady().then(async () => {
     return view
   })
   secureIpcHandle('comments-window:get-snapshot', () => currentCommentsView())
-  secureIpcHandle('comments-window:set-view-mode', (event, value: unknown) => {
+  secureIpcHandle('comments-window:set-view-mode', async (event, value: unknown) => {
     const mode = parseCommentsViewMode(value)
     if (!mode) {
       throw new Error('Comments view mode must be live or a complete history selection.')
@@ -11296,14 +12103,9 @@ app.whenReady().then(async () => {
     ) {
       throw new Error('This window cannot change the Comments view mode.')
     }
-    if (
-      mode.kind === 'history' &&
-      commentsHistorySnapshots.get(mode.sessionId)?.sessionId !== mode.sessionId
-    ) {
-      throw new Error('The requested Comments history snapshot is unavailable.')
+    if (await selectCommentsViewMode(mode)) {
+      emitCommentsView()
     }
-    commentsViewMode = mode
-    emitCommentsView()
     return currentCommentsView()
   })
   secureIpcHandle('comments-window:push-delta', (event, delta: CommentsSnapshotDelta) => {
@@ -11326,7 +12128,7 @@ app.whenReady().then(async () => {
     }
     latestLiveCommentsSnapshot = next
     if (
-      commentsViewMode.kind === 'live' &&
+      commentsViewSelection.current().kind === 'live' &&
       commentsWindow &&
       !commentsWindow.webContents.isDestroyed()
     ) {
@@ -11575,8 +12377,29 @@ app.whenReady().then(async () => {
 
   createWindow()
   setDockIcon()
-  await primeScreenCapturePermission()
-  startBackend()
+  if (firstRunCompleted()) {
+    await primeScreenCapturePermission()
+    // Ask for camera + microphone once the window is visible (an inactive app
+    // gets its prompts suppressed), before any backend device access, so the
+    // backend child inherits the host's grant from the first frame. Fire and
+    // forget: the first device use is operator-driven, never startup-blocking.
+    const permissionPrimerWindow = mainWindow
+    if (permissionPrimerWindow && !permissionPrimerWindow.isDestroyed()) {
+      if (permissionPrimerWindow.isVisible()) {
+        void primeCameraMicrophonePermissions()
+      } else {
+        permissionPrimerWindow.once('show', () => void primeCameraMicrophonePermissions())
+      }
+    } else {
+      void primeCameraMicrophonePermissions()
+    }
+    startBackend()
+  }
+  // First run: NO permission prompt and NO backend device enumeration may
+  // fire before the user reaches the permissions step — the gate chain
+  // (agreement → welcome → permissions) owns every ask. The ungate handler
+  // (app:set-window-gated false) runs the deferred startBackend once the
+  // chain completes.
   startSmokePreviewMotionServer()
 
   app.on('activate', () => {

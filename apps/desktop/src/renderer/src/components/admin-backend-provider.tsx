@@ -1,6 +1,8 @@
 import { createContext, useContext, type ReactElement, type ReactNode } from 'react'
 
 import { useAdminBackend, type UseAdminBackend } from '@/hooks/use-admin-backend'
+import { LivingTextAutoDetector } from '@/components/living-text-auto-detector'
+import { NdiFrameProducer } from '@/components/ndi-frame-producer'
 
 // Sermons/Videos/Events/Members/Alerts each used to call useAdminBackend()
 // independently, so every tab owned its own WebSocket connection and state —
@@ -13,7 +15,13 @@ const AdminBackendContext = createContext<UseAdminBackend | null>(null)
 
 export function AdminBackendProvider({ children }: { children: ReactNode }): ReactElement {
   const value = useAdminBackend()
-  return <AdminBackendContext.Provider value={value}>{children}</AdminBackendContext.Provider>
+  return (
+    <AdminBackendContext.Provider value={value}>
+      {children}
+      <LivingTextAutoDetector />
+      <NdiFrameProducer />
+    </AdminBackendContext.Provider>
+  )
 }
 
 export function useAdminBackendContext(): UseAdminBackend {

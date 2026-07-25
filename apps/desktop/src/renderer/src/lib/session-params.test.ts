@@ -24,7 +24,8 @@ describe('buildStartSessionParams', () => {
       captureConfig: captureConfig(),
       scene,
       settings: {
-        outputDirectory: '   '
+        outputDirectory: '   ',
+        keepOriginalRecording: false
       }
     })
 
@@ -41,8 +42,9 @@ describe('buildStartSessionParams', () => {
       scene,
       settings: {
         outputDirectory: '  /tmp/videos  ',
+        keepOriginalRecording: false,
         ffmpegPath: '  /opt/bin/ffmpeg  '
-      } as { outputDirectory: string; ffmpegPath: string }
+      } as { outputDirectory: string; keepOriginalRecording: boolean; ffmpegPath: string }
     })
 
     expect(params.output.outputDirectory).toBeUndefined()
@@ -59,7 +61,8 @@ describe('buildStartSessionParams', () => {
       captureConfig: captureConfig(),
       scene,
       settings: {
-        outputDirectory: ''
+        outputDirectory: '',
+        keepOriginalRecording: false
       }
     })
 
@@ -72,7 +75,8 @@ describe('buildStartSessionParams', () => {
       scene,
       sceneEditMode: true,
       settings: {
-        outputDirectory: ''
+        outputDirectory: '',
+        keepOriginalRecording: false
       }
     })
 
@@ -100,7 +104,7 @@ describe('buildStartSessionParams', () => {
     const params = buildStartSessionParams({
       captureConfig: captureConfig(),
       scene: withBackground,
-      settings: { outputDirectory: '' }
+      settings: { outputDirectory: '', keepOriginalRecording: false }
     })
 
     expect(params.scene).toBe(withBackground)
@@ -122,7 +126,8 @@ describe('buildStartSessionParams', () => {
       captureConfig: config,
       scene,
       settings: {
-        outputDirectory: ''
+        outputDirectory: '',
+        keepOriginalRecording: false
       }
     })
 
@@ -138,6 +143,8 @@ describe('buildStartSessionParams', () => {
         burnTarget: 'both',
         styleId: 'lower-third',
         language: 'es',
+        provider: 'cloud',
+        deepgramApiKey: 'dg-test-key',
         styleRevision: 4,
         position: 'top',
         textSize: 'l'
@@ -146,7 +153,7 @@ describe('buildStartSessionParams', () => {
     const params = buildStartSessionParams({
       captureConfig: config,
       scene,
-      settings: { outputDirectory: '' }
+      settings: { outputDirectory: '', keepOriginalRecording: false }
     })
 
     expect(params.captions).toEqual({ ...config.captions, suppressedForSession: false })
@@ -159,7 +166,7 @@ describe('buildStartSessionParams', () => {
     const params = buildStartSessionParams({
       captureConfig: config,
       scene,
-      settings: { outputDirectory: '' },
+      settings: { outputDirectory: '', keepOriginalRecording: false },
       suppressCaptionsForSession: true
     })
 
@@ -181,7 +188,7 @@ describe('buildStartSessionParams', () => {
     const params = buildStartSessionParams({
       captureConfig: config,
       scene,
-      settings: { outputDirectory: '' }
+      settings: { outputDirectory: '', keepOriginalRecording: false }
     })
 
     expect(params.captions).toMatchObject({
@@ -204,7 +211,7 @@ describe('buildStartSessionParams', () => {
     const params = buildStartSessionParams({
       captureConfig: config,
       scene,
-      settings: { outputDirectory: '' }
+      settings: { outputDirectory: '', keepOriginalRecording: false }
     })
 
     expect(params.captions).toMatchObject({
@@ -232,7 +239,8 @@ describe('buildStartSessionParams', () => {
       captureConfig: config,
       scene,
       settings: {
-        outputDirectory: ''
+        outputDirectory: '',
+        keepOriginalRecording: false
       }
     })
 
@@ -264,7 +272,8 @@ describe('buildStartSessionParams', () => {
       captureConfig: config,
       scene,
       settings: {
-        outputDirectory: ''
+        outputDirectory: '',
+        keepOriginalRecording: false
       }
     })
 

@@ -25,6 +25,8 @@ export const IPC_INVOKE_ROLES = {
   'app:set-native-theme': MAIN_ONLY,
   'app:quit': MAIN_ONLY,
   'app:set-window-gated': MAIN_ONLY,
+  'app:get-screen-access-status': MAIN_ONLY,
+  'app:request-screen-access': MAIN_ONLY,
   'system:open-permissions': MAIN_ONLY,
   'system:request-media-access': MAIN_ONLY,
   'system:media-access-status': MAIN_ONLY,
@@ -75,6 +77,7 @@ export const IPC_INVOKE_ROLES = {
   'preview-surface:destroy': MAIN_ONLY,
   'preview-surface:status': MAIN_ONLY,
   'notes-window:open': MAIN_ONLY,
+  'global-shortcuts:set': MAIN_ONLY,
   'notes-window:close': MAIN_ONLY,
   'notes-window:get-state': MAIN_AND_NOTES,
   'notes-window:set-always-on-top': MAIN_AND_NOTES,
@@ -132,7 +135,13 @@ export function rendererRoleFromArguments(arguments_: readonly string[]): Render
       break
     }
   }
-  return raw === 'main' || raw === 'notes' || raw === 'comments' || raw === 'captions' ? raw : null
+  return raw === 'main' ||
+    raw === 'notes' ||
+    raw === 'comments' ||
+    raw === 'captions' ||
+    raw === 'livingTextOutput'
+    ? raw
+    : null
 }
 
 export function rendererRoleArgument(role: RendererRole): string {

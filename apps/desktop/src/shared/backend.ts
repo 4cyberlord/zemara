@@ -174,6 +174,28 @@ export interface AdminRegisterResult {
   apiKey: string
 }
 
+// The signed-in church staff session (mirrors the Rust AdminIdentity). The
+// rk_ API key is the machine credential; this identifies WHO is at the desk
+// and which church they belong to. Cached in the secrets file by the Rust
+// backend so the sign-in gate can be skipped on later launches.
+export interface AdminIdentityUser {
+  id: string
+  name: string
+  email: string
+  role: string
+}
+
+export interface AdminIdentityOrganization {
+  id: string
+  name: string
+  slug: string
+}
+
+export interface AdminIdentity {
+  user: AdminIdentityUser
+  organization: AdminIdentityOrganization
+}
+
 // Rust's AdminSermon/SermonSeries serialize every Option<T> as an explicit
 // JSON `null` (no skip_serializing_if on these result types) — matching the
 // admin API's own JSON, which always includes nullable columns as `null`
@@ -269,6 +291,8 @@ export interface LivingTextCitation {
   verseStart: number | null
   verseEnd: number | null
   matchType: 'explicit' | 'chapter'
+  /** 0-1 detection confidence from the backend (Rhema-style scoring). */
+  confidence: number
   sourceText: string
   index: number
 }
@@ -276,6 +300,14 @@ export interface LivingTextCitation {
 export interface LivingTextResolvedCitation extends LivingTextCitation {
   resolved: boolean
   verses: LivingTextVerse[]
+}
+
+export interface LivingTextSearchHit {
+  book: string
+  bookNumber: number
+  chapter: number
+  verse: number
+  snippet: string
 }
 
 // Rust's AdminVideo/VideoCategory serialize every Option<T> as an explicit
@@ -961,7 +993,7 @@ export interface ResourceSelection {
 }
 
 export interface BackendLifecycleEvent {
-  state: 'running' | 'restarting' | 'failed'
+  state: 'running' | 'restarting' | 'failed' | 'lost'
   code?: number | null
   signal?: string | null
   attempt?: number
@@ -1830,6 +1862,8 @@ export interface OutputSettings {
   outputDirectory?: string
   outputDirectoryCapability?: string
   ffmpegPath?: string
+  /** Keep the capture MKV (lossless audio) next to the exported MP4. */
+  keepOriginalMkv?: boolean
   video: VideoSettings
   rtmp: RtmpSettings
 }
@@ -1853,6 +1887,11 @@ export interface CaptionsSessionParams {
   burnTarget: 'off' | 'stream' | 'recording' | 'both'
   styleId: CaptionStyleId
   language: string
+  /** Speech engine for this session: on-device, or a network provider
+   *  (Deepgram when deepgramApiKey is set, otherwise the gateway). */
+  provider: CaptionEnginePreference
+  /** Operator's own Deepgram key — used only when provider is 'cloud'. */
+  deepgramApiKey: string | null
   styleRevision: number
   position?: 'top' | 'bottom'
   textSize?: 's' | 'm' | 'l'
@@ -1920,6 +1959,9 @@ export type EncodeBackend =
   | 'hardware-videotoolbox'
   | 'hardware-media-foundation'
   | 'software-media-foundation'
+  // libopenh264 software fallback on Windows — software Media Foundation ran
+  // below realtime on real devices (issue #149).
+  | 'software-open-h264'
 export type CompositorBackend = 'metal' | 'cpu' | 'cpu-fallback'
 
 /** Cumulative request counts for the HTTP image-polling preview transports. A native
@@ -2153,6 +2195,13 @@ export interface PreviewSurfaceStatus {
   framesRendered: number
   presentedFrameId?: number
   compositorFrameLag?: number
+  /** Windows proof-surface transport metrics (issue #157): observed frame
+   * request rate, payload bandwidth, decode cadence, and decoded per-layer
+   * source dimensions. Absent on native CAMetalLayer transports. */
+  proofTransportRequestsPerSecond?: number
+  proofTransportBytesPerSecond?: number
+  proofTransportDecodedFramesPerSecond?: number
+  proofSourceDimensions?: Record<string, { width: number; height: number }>
   droppedFrames: number
   inputToPresentLatencyMs?: number
   inputToPresentLatencyP50Ms?: number
@@ -2824,11 +2873,11 @@ export interface MediaAccessSnapshot {
 
 export interface HealthEvent {
   id: string
-  sessionId?: string
+  sessionId?: string | null
   level: HealthLevel
   code: string
   message: string
-  permissionPane?: SystemPermissionPane
+  permissionPane?: SystemPermissionPane | null
   createdAt: string
 }
 
@@ -2838,8 +2887,8 @@ export interface SessionLogEntry {
   level: HealthLevel
   code: string
   message: string
-  sourceId?: string
-  permissionPane?: SystemPermissionPane
+  sourceId?: string | null
+  permissionPane?: SystemPermissionPane | null
   createdAt: string
 }
 
@@ -3088,7 +3137,7 @@ export interface AiArtifact {
   createdAt: string
 }
 
-export interface SessionSummary {
+export interface SessionListItem {
   id: string
   title: string
   startedAt: string
@@ -3105,18 +3154,59 @@ export interface SessionSummary {
   /** "Screen + Camera" etc. (derived layout preset; stream preset when stream-only). */
   sceneLabel?: string
   qualityStatus?: GateStatus | null
-  finalDiagnostics?: DiagnosticStats | null
-  layout: LayoutSettings
-  sources: SourceSelection
-  healthEvents: HealthEvent[]
-  sessionLogs: SessionLogEntry[]
-  aiArtifacts: AiArtifact[]
+  healthEventCount: number
+  sessionLogCount: number
+  aiArtifactCount: number
+  readyAiArtifactKinds?: AiArtifactKind[]
   commentCount: number
   /** Present only for managed derivatives created from another Library session. */
   derivedFromSessionId?: string
   sourceTitle?: string
   processingKind?: 'noise-cleanup'
 }
+
+/** Backwards-compatible name for renderer consumers while the Library model
+ * remains a summary. It intentionally has no history arrays. */
+export type SessionSummary = SessionListItem
+
+export interface SessionListParams {
+  cursor?: string
+  limit?: number
+}
+
+export interface SessionListPage {
+  items: SessionListItem[]
+  nextCursor?: string
+}
+
+export interface SessionDetailListParams {
+  sessionId: string
+  cursor?: string
+  limit?: number
+}
+
+export interface SessionHealthEventsPage {
+  events: HealthEvent[]
+  nextCursor?: string
+}
+
+export interface SessionLogsPage {
+  entries: SessionLogEntry[]
+  nextCursor?: string
+}
+
+export interface SessionAiArtifactsPage {
+  artifacts: AiArtifact[]
+  nextCursor?: string
+}
+
+export interface SessionDetails {
+  healthEvents: HealthEvent[]
+  sessionLogs: SessionLogEntry[]
+  aiArtifacts: AiArtifact[]
+}
+
+export type SessionWithDetails = SessionListItem & SessionDetails
 
 export interface SessionStorageTotals {
   count: number
@@ -3427,11 +3517,46 @@ export interface LivingTextOutputState {
 }
 
 export interface LivingTextOutputTheme {
+  // --- Background ---
+  backgroundType: 'solid' | 'gradient' | 'image'
   backgroundColor: string
+  // gradient
+  gradientAngle: number
+  gradientColorStart: string
+  gradientColorEnd: string
+  // image
+  backgroundImagePath: string | null
+  backgroundImageOpacity: number // 0-1
+
+  // --- Verse text ---
   textColor: string
-  referenceColor: string
   fontSize: number
+  fontFamily: string
+  fontWeight: number // 100-900
+  lineHeight: number // e.g. 1.3
+  letterSpacing: number // em units, e.g. 0.02
   textAlign: 'left' | 'center' | 'right'
+  textShadowBlur: number
+  textShadowX: number
+  textShadowY: number
+  textShadowColor: string
+  textStrokeWidth: number
+  textStrokeColor: string
+
+  // --- Reference line ---
+  referenceColor: string
+  referenceAlign: 'left' | 'center' | 'right'
+  referenceFontSize: number // 0 = auto (40% of fontSize)
+
+  // --- Layout ---
+  verticalPosition: 'top' | 'center' | 'bottom'
+  horizontalPaddingPct: number // % of width
+  maxWidthPct: number // % of width
+
+  // --- Output ---
+  displayMode: 'fullscreen' | 'lower-third'
+  resolutionWidth: number
+  resolutionHeight: number
 }
 
 export interface LivingTextOutputVerse {
@@ -3442,6 +3567,51 @@ export interface LivingTextOutputVerse {
 export interface LivingTextOutputPayload {
   theme: LivingTextOutputTheme
   verse: LivingTextOutputVerse | null
+}
+
+// --- NDI broadcast output -------------------------------------------------
+// Mirrors crates/videorc-backend/src/ndi.rs (serde camelCase). NDI is a
+// registered trademark of Vizrt NDI AB; the SDK is loaded dynamically by the
+// backend from sdk/ndi/<platform>/ (see scripts/download-ndi-sdk.mjs).
+
+export type NdiResolution = 'r720p' | 'r1080p' | 'r4k'
+export type NdiFrameRate = 'fps24' | 'fps30' | 'fps60'
+/** Pewbeam also lists "premultiplied", but their sender passes alpha through
+ *  unmultiplied — an honest contract offers only what it honors. */
+export type NdiAlphaMode = 'noneOpaque' | 'straightAlpha'
+
+export interface NdiConfig {
+  sourceName: string
+  resolution: NdiResolution
+  frameRate: NdiFrameRate
+  alphaMode: NdiAlphaMode
+}
+
+export interface NdiStatus {
+  active: boolean
+  sourceName: string | null
+  width: number
+  height: number
+  fps: number
+  frameCount: number
+  /** Present when the NDI SDK could not be loaded — surfaced, never silent. */
+  unavailableReason: string | null
+}
+
+export interface NdiFrameAck {
+  frameCount: number
+}
+
+export const NDI_RESOLUTION_DIMENSIONS: Record<NdiResolution, { width: number; height: number }> = {
+  r720p: { width: 1280, height: 720 },
+  r1080p: { width: 1920, height: 1080 },
+  r4k: { width: 3840, height: 2160 }
+}
+
+export const NDI_FRAME_RATE_FPS: Record<NdiFrameRate, number> = {
+  fps24: 24,
+  fps30: 30,
+  fps60: 60
 }
 
 export interface CommentsWindowState {
@@ -3505,7 +3675,29 @@ export type OAuthCallbackEnvelope = {
   receivedAtMs: number
 }
 
+export interface RemoteControlStatus {
+  enabled: boolean
+  token: string | null
+  port: number
+  connectedClients: number
+  discoveryPath: string | null
+}
+
+export interface GlobalShortcutsConfig {
+  recordToggle?: string
+  streamToggle?: string
+  micToggle?: string
+}
+
+export interface GlobalShortcutsResult {
+  registered: Record<string, boolean>
+}
+
 export interface VideorcApi {
+  setGlobalShortcuts?: (shortcuts: GlobalShortcutsConfig) => Promise<GlobalShortcutsResult>
+  onGlobalShortcut?: (
+    callback: (action: 'record-toggle' | 'stream-toggle' | 'mic-toggle') => void
+  ) => () => void
   getBackendConnection: () => Promise<BackendConnection | null>
   getBackendLogs: () => Promise<BackendLogEvent[]>
   getRuntimeInfo: () => Promise<RuntimeInfo>
@@ -3642,6 +3834,11 @@ export interface VideorcApi {
   // once they clear — so the real app never renders inside an oversized,
   // mostly-empty window behind a small dialog.
   setWindowGated: (gated: boolean) => Promise<void>
+  // Screen Recording TCC status (preflight — never prompts) and the explicit
+  // ask used by the first-run permissions step, so the system prompt only
+  // appears when the user clicks Enable there.
+  getScreenAccessStatus: () => Promise<MediaAccessStatus>
+  requestScreenAccess: () => Promise<MediaAccessStatus>
   // True while the MAIN process pumps presents from its own backend socket;
   // the renderer pump stays dormant then and resumes only as a fallback.
   getNativePreviewMainPumpActive: () => Promise<boolean>
@@ -3894,11 +4091,18 @@ export type CaptionsState =
 export type CaptionStyleId = 'classic' | 'glass' | 'lower-third' | 'high-contrast'
 export type CaptionTransport = 'realtime' | 'chunked'
 export type CaptionAudioSource = 'microphone'
+/** The engine that owns a caption session: bundled on-device model, the
+ *  operator's own Deepgram key, or the signed-in Zemara gateway. */
+export type CaptionProvider = 'local' | 'deepgram' | 'cloud'
+/** Operator's speech-engine choice: on-device, or a network provider
+ *  (Deepgram when a key is configured, otherwise the gateway). */
+export type CaptionEnginePreference = 'local' | 'cloud'
 
 export interface CaptionsStatus {
   state: CaptionsState
   desiredEnabled?: boolean
   transport?: CaptionTransport
+  provider?: CaptionProvider
   audioSource?: CaptionAudioSource
   audioFramesSeen?: number
   droppedAudioFrames?: number

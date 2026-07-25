@@ -53,6 +53,7 @@ use crate::encoder_bridge::{
 use crate::entitlements;
 use crate::ffmpeg::{ffprobe_path_for, resolve_ffmpeg_path};
 use crate::ffmpeg_work::{CapturePermit, MaintenanceCancelToken};
+use crate::h264_profile::{h264_high_level_label, quality_posture_canvas_envelope};
 use crate::pipeline::{RecordingPipeline, container_for_outputs, container_key};
 use crate::preview_camera::{
     preview_camera_latest_frame_info, reset_preview_camera_capture_timings,
@@ -107,6 +108,7 @@ use crate::streaming::{
 };
 
 const PREVIEW_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
+const PREVIEW_STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 /// How often the live mic-stats sampler reads CoreAudio counters during a recording.
 const NATIVE_AUDIO_SAMPLE_INTERVAL: Duration = Duration::from_millis(1000);
 /// Silent-mic health check (plan 021 F3): how deep into a recording the mic may
@@ -200,6 +202,53 @@ fn spawn_authorized_capture_process(
 ) -> io::Result<tokio::process::Child> {
     spawn_owned_tokio(command)
 }
+/// Owns FFmpeg until its startup resources become part of an active recording.
+/// Any early error drops this guard, which terminates/reaps the child and
+/// removes its startup FIFOs before another capture can reuse those resources.
+struct UncommittedCaptureProcess {
+    child: Option<tokio::process::Child>,
+    fifo_paths: Vec<PathBuf>,
+}
+
+impl UncommittedCaptureProcess {
+    fn new(child: tokio::process::Child, fifo_paths: Vec<PathBuf>) -> Self {
+        Self {
+            child: Some(child),
+            fifo_paths,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child
+            .as_mut()
+            .expect("uncommitted capture process must own its child")
+    }
+
+    fn commit(mut self) -> tokio::process::Child {
+        self.fifo_paths.clear();
+        self.child
+            .take()
+            .expect("uncommitted capture process must own its child")
+    }
+}
+
+impl Drop for UncommittedCaptureProcess {
+    fn drop(&mut self) {
+        for fifo_path in &self.fifo_paths {
+            let _ = crate::fifo::cleanup(fifo_path);
+        }
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = child.start_kill();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = child.wait().await;
+            });
+        }
+    }
+}
+
 const RECORDING_PREVIEW_WIDTH: u32 = 640;
 const RECORDING_PREVIEW_HEIGHT: u32 = 360;
 const RECORDING_PREVIEW_FPS: u32 = 5;
@@ -271,6 +320,11 @@ const FFMPEG_LIVE_AUDIO_READY_TIMEOUT: Duration =
 // Keep a full extra reporting interval plus scheduling headroom so a command
 // written just after a report cannot time out after FFmpeg has applied it.
 const FFMPEG_LIVE_AUDIO_REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+// One stdin command is sent to every active FFmpeg filter graph. Replies are
+// emitted as one synchronous burst, including ENOSYS replies from unrelated
+// video graphs. Drain that burst before associating the next command with its
+// acknowledgements.
+const FFMPEG_LIVE_AUDIO_REPLY_SETTLE_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct FfmpegFilterCommandReply {
@@ -435,16 +489,33 @@ impl FfmpegLiveAudioControl {
         }
 
         let replies = timeout(FFMPEG_LIVE_AUDIO_REPLY_TIMEOUT, async {
-            let mut first_failure = None;
-            for _ in 0..self.expected_replies {
-                let Some(reply) = self.replies.recv().await else {
-                    bail!("FFmpeg closed the live microphone command reply channel");
-                };
-                if reply.return_code != 0 && first_failure.is_none() {
+            let Some(first_reply) = self.replies.recv().await else {
+                bail!("FFmpeg closed the live microphone command reply channel");
+            };
+            let mut successful_replies = usize::from(first_reply.return_code == 0);
+            let mut first_failure =
+                (first_reply.return_code != 0).then_some(first_reply.return_code);
+
+            while let Ok(Some(reply)) =
+                timeout(FFMPEG_LIVE_AUDIO_REPLY_SETTLE_TIMEOUT, self.replies.recv()).await
+            {
+                if reply.return_code == 0 {
+                    successful_replies += 1;
+                } else if first_failure.is_none() {
                     first_failure = Some(reply.return_code);
                 }
             }
-            Ok::<Option<i32>, anyhow::Error>(first_failure)
+
+            if successful_replies >= self.expected_replies {
+                Ok::<Option<i32>, anyhow::Error>(None)
+            } else if let Some(return_code) = first_failure {
+                Ok(Some(return_code))
+            } else {
+                bail!(
+                    "FFmpeg acknowledged {successful_replies} of {} live microphone filters",
+                    self.expected_replies
+                )
+            }
         })
         .await;
 
@@ -719,6 +790,10 @@ pub struct ActiveRecording {
     /// Finalization may render a non-destructive `(captioned)` copy only when
     /// this is true; the source recording itself always stays clean.
     captioned_copy_requested: bool,
+    /// Frozen at session start from output.keepOriginalMkv: finalization
+    /// keeps the lossless-audio capture MKV next to the published MP4
+    /// instead of removing it after commit.
+    keep_original_media: bool,
     /// True only when this session has a viewer-facing stream leg rendered by
     /// the compositor bridge. Legacy FFmpeg and record-only paths must reject
     /// comment highlights before touching the overlay slot.
@@ -1383,7 +1458,7 @@ pub async fn start_session(
     if !use_encoder_bridge {
         state.emit_log(
             "warn",
-            "Session is using the legacy FFmpeg capture path (encoder bridge disabled by env or fps > 30).",
+            "Session is using the legacy FFmpeg capture path (encoder bridge disabled by env, streaming above 30fps, or 4K60).",
         );
     }
     // Shared session epoch (plan slice A2): the encoder bridge sets this at its first
@@ -1736,9 +1811,19 @@ pub async fn start_session(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child =
+    let mut uncommitted_capture_process = UncommittedCaptureProcess::new(
         spawn_authorized_capture_process(&mut command, session_start_publication_permit)
-            .with_context(|| format!("Could not start {ffmpeg_path}"))?;
+            .with_context(|| format!("Could not start {ffmpeg_path}"))?,
+        [
+            encoder_bridge_fifo.clone(),
+            encoder_bridge_stream_fifo.clone(),
+            screen_overlay_fifo.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect(),
+    );
+    let child = uncommitted_capture_process.child_mut();
 
     let stderr = child.stderr.take();
     let stdout = child.stdout.take();
@@ -1795,6 +1880,11 @@ pub async fn start_session(
             encoder_bridge_frame_store.clone(),
             encoder_bridge_video_output,
             Some(params.output.video.bitrate_kbps),
+            // Low latency only when live legs consume THIS output (shared
+            // leg while streaming); a record-only output — including the
+            // recording leg beside a dedicated stream bridge — encodes for
+            // quality.
+            params.output.stream_enabled && encoder_bridge_stream_profile.is_none(),
             recording_diagnostics_context,
             video_epoch.clone(),
         )?;
@@ -1821,6 +1911,7 @@ pub async fn start_session(
                     Some(stream_frame_store),
                     encoder_bridge_video_output,
                     Some(stream_profile.bitrate_kbps),
+                    true,
                     stream_diagnostics_context,
                     video_epoch.clone(),
                 )?)
@@ -1877,11 +1968,13 @@ pub async fn start_session(
         encoder_bridge,
         encoder_bridge_stream,
         captioned_copy_requested: session_caption_plan.captioned_copy,
+        keep_original_media: params.output.keep_original_mkv,
         comment_highlight_available: comment_highlight_available(&params, use_encoder_bridge),
         _capture_permit: Some(capture_permit),
         stop_intent_sender: Some(stop_intent_sender),
         stop_requested: false,
     };
+    let child = uncommitted_capture_process.commit();
     // The fully-constructed pipeline is now committed to becoming an active
     // capture. Advance the caption epoch only here, after every fallible startup
     // step, so an early start failure cannot create an orphan caption session.
@@ -1957,7 +2050,14 @@ pub async fn start_session(
         let language = (!captions.language.trim().is_empty()
             && !captions.language.eq_ignore_ascii_case("auto"))
         .then(|| captions.language.clone());
-        if let Err(error) = crate::captions::start_captions(&state, language).await {
+        let start_params = crate::captions::CaptionStartParams {
+            language,
+            provider: Some(captions.provider),
+            deepgram_api_key: captions.deepgram_api_key.clone(),
+            microphone_id: None,
+            allow_idle_session: None,
+        };
+        if let Err(error) = crate::captions::start_captions(&state, start_params).await {
             let message = format!("Live captions could not start: {error}");
             crate::captions::block_captions(&state, "captions-start-failed", message.clone()).await;
             let _ = emit_health_event(
@@ -2618,6 +2718,72 @@ where
     Ok(published.path.display().to_string())
 }
 
+/// A stop leaves the two capture streams with misaligned flush tails (the
+/// recording-quality audit measured up to 273ms of trailing silent video at
+/// 60fps). Tails inside this bound are left alone; beyond it the MP4 export
+/// trims to the shorter stream so the delivered file ends with synchronized
+/// A/V.
+const MP4_EXPORT_TAIL_TRIM_THRESHOLD_SECONDS: f64 = 0.05;
+
+/// Matroska per-stream `DURATION` tag, `HH:MM:SS.nnnnnnnnn`.
+fn parse_mkv_duration_tag(tag: &str) -> Option<f64> {
+    let mut parts = tag.trim().splitn(3, ':');
+    let hours: f64 = parts.next()?.parse().ok()?;
+    let minutes: f64 = parts.next()?.parse().ok()?;
+    let seconds: f64 = parts.next()?.parse().ok()?;
+    Some(hours * 3600.0 + minutes * 60.0 + seconds)
+}
+
+/// Probe the capture MKV's video/audio stream durations and return the
+/// duration to trim the MP4 export to — `None` when the tails already agree,
+/// when a stream is missing, or when the probe fails (export proceeds
+/// untrimmed; a failed probe must never block finalization).
+async fn mp4_export_trim_seconds(ffprobe_path: &str, input: &Path) -> Option<f64> {
+    let output = Command::new(ffprobe_path)
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,duration:stream_tags=DURATION",
+            "-of",
+            "json",
+        ])
+        .arg(input)
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let probe: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let mut video_seconds = None;
+    let mut audio_seconds = None;
+    for stream in probe.get("streams")?.as_array()? {
+        let seconds = stream
+            .get("duration")
+            .and_then(|duration| duration.as_str())
+            .and_then(|duration| duration.parse::<f64>().ok())
+            .or_else(|| {
+                stream
+                    .get("tags")?
+                    .get("DURATION")?
+                    .as_str()
+                    .and_then(parse_mkv_duration_tag)
+            });
+        match stream.get("codec_type").and_then(|kind| kind.as_str()) {
+            Some("video") => video_seconds = video_seconds.or(seconds),
+            Some("audio") => audio_seconds = audio_seconds.or(seconds),
+            _ => {}
+        }
+    }
+    let (video_seconds, audio_seconds) = (video_seconds?, audio_seconds?);
+    if (video_seconds - audio_seconds).abs() <= MP4_EXPORT_TAIL_TRIM_THRESHOLD_SECONDS {
+        return None;
+    }
+    let trim = video_seconds.min(audio_seconds);
+    (trim > 0.0).then_some(trim)
+}
+
 async fn export_mp4_from_mkv(ffmpeg_path: &str, input: &Path, output: &Path) -> Result<()> {
     if output
         .try_exists()
@@ -2628,8 +2794,9 @@ async fn export_mp4_from_mkv(ffmpeg_path: &str, input: &Path, output: &Path) -> 
             output.display()
         );
     }
+    let trim_seconds = mp4_export_trim_seconds(&ffprobe_path_for(ffmpeg_path), input).await;
     let mut command = Command::new(ffmpeg_path);
-    command.args(mp4_export_args(input, output));
+    command.args(mp4_export_args(input, output, trim_seconds));
     let status = status_owned_tokio(&mut command)
         .await
         .with_context(|| format!("Could not start {ffmpeg_path} for MP4 export"))?;
@@ -2876,8 +3043,8 @@ async fn publish_staged_media_uniquely(staging: PathBuf, preferred: PathBuf) -> 
     .context("Could not join staged recording publish task")?
 }
 
-fn mp4_export_args(input: &Path, output: &Path) -> Vec<String> {
-    vec![
+fn mp4_export_args(input: &Path, output: &Path, trim_seconds: Option<f64>) -> Vec<String> {
+    let mut args = vec![
         "-n".to_string(),
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
@@ -2890,12 +3057,20 @@ fn mp4_export_args(input: &Path, output: &Path) -> Vec<String> {
         "copy".to_string(),
         "-c:a".to_string(),
         "aac".to_string(),
+        // 256k stereo AAC: transparent for voice+music mixes; the capture
+        // MKV's PCM is the lossless source when the keep-original setting is
+        // on (recording-quality plan Q4).
         "-b:a".to_string(),
-        "160k".to_string(),
+        "256k".to_string(),
         "-movflags".to_string(),
         "+faststart".to_string(),
-        output.display().to_string(),
-    ]
+    ];
+    if let Some(trim_seconds) = trim_seconds {
+        // Bound the stop tail: end the delivered file at the shorter stream.
+        args.extend(["-t".to_string(), format!("{trim_seconds:.3}")]);
+    }
+    args.push(output.display().to_string());
+    args
 }
 
 pub async fn create_preview_snapshot(
@@ -2920,6 +3095,7 @@ pub async fn create_preview_snapshot(
             stream_enabled: false,
             output_directory: None,
             ffmpeg_path: Some(ffmpeg_path.clone()),
+            keep_original_mkv: false,
             video: default_video_settings(),
             rtmp: RtmpSettings {
                 preset: RtmpPreset::Custom,
@@ -2965,6 +3141,16 @@ struct PreviewCommandOutput {
     stderr: Vec<u8>,
 }
 
+async fn collect_preview_stderr(stderr_task: &mut tokio::task::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    match timeout(PREVIEW_STDERR_DRAIN_TIMEOUT, &mut *stderr_task).await {
+        Ok(Ok(stderr)) => stderr,
+        Ok(Err(_)) => Vec::new(),
+        Err(_) => {
+            stderr_task.abort();
+            Vec::new()
+        }
+    }
+}
 async fn run_preview_command(ffmpeg_path: &str, args: &[String]) -> Result<PreviewCommandOutput> {
     run_preview_command_with_timeout(ffmpeg_path, args, PREVIEW_SNAPSHOT_TIMEOUT).await
 }
@@ -2983,7 +3169,7 @@ async fn run_preview_command_with_timeout(
         .with_context(|| format!("Could not start {ffmpeg_path} for preview"))?;
 
     let stderr = child.stderr.take();
-    let stderr_task = tokio::spawn(async move {
+    let mut stderr_task = tokio::spawn(async move {
         let mut bytes = Vec::new();
         if let Some(mut stderr) = stderr {
             let _ = stderr.read_to_end(&mut bytes).await;
@@ -2998,7 +3184,7 @@ async fn run_preview_command_with_timeout(
         Err(_) => {
             let _ = child.kill().await;
             let _ = child.wait().await;
-            let stderr = stderr_task.await.unwrap_or_default();
+            let stderr = collect_preview_stderr(&mut stderr_task).await;
             let message = String::from_utf8_lossy(&stderr).trim().to_string();
             bail!(
                 "Preview snapshot timed out after {} seconds{}",
@@ -3011,7 +3197,7 @@ async fn run_preview_command_with_timeout(
             );
         }
     };
-    let stderr = stderr_task.await.unwrap_or_default();
+    let stderr = collect_preview_stderr(&mut stderr_task).await;
 
     Ok(PreviewCommandOutput { status, stderr })
 }
@@ -3210,6 +3396,7 @@ fn live_preview_session_params(
             stream_enabled: false,
             output_directory: None,
             ffmpeg_path: Some(ffmpeg_path),
+            keep_original_mkv: false,
             video,
             rtmp: RtmpSettings {
                 preset: RtmpPreset::Custom,
@@ -4168,6 +4355,7 @@ async fn monitor_session(
                 started_at: active.started_at.clone(),
                 pipeline: active.pipeline.clone(),
                 captioned_copy_requested: active.captioned_copy_requested,
+                keep_original_media: active.keep_original_media,
                 native_audio_stats,
             }
         });
@@ -4341,6 +4529,7 @@ async fn monitor_session(
                         duration_ms,
                         diagnostics: &final_diagnostics,
                         output_ownership: output_ownership.clone(),
+                        keep_original_media: monitored_recording.keep_original_media,
                     },
                     &mut finalization_recovery_path,
                 )
@@ -5211,6 +5400,7 @@ async fn export_completed_recording_to_mp4(
         duration_ms,
         diagnostics,
         output_ownership,
+        keep_original_media,
     } = context;
     let base_finalization = SessionFinalization::new(
         session_id,
@@ -5227,7 +5417,9 @@ async fn export_completed_recording_to_mp4(
             session_id,
             input,
             base_finalization,
-            remove_output_after_commit: output_ownership.is_some(),
+            // The user's "keep original recording" setting wins: the MKV
+            // (lossless PCM audio) stays next to the published MP4.
+            remove_output_after_commit: output_ownership.is_some() && !keep_original_media,
             output_ownership,
             fault: Mp4FinalizationFault::None,
         },
@@ -5478,6 +5670,7 @@ struct Mp4ExportFinalizationContext<'a> {
     duration_ms: Option<i64>,
     diagnostics: &'a DiagnosticStats,
     output_ownership: Option<SessionFileBoundIdentity>,
+    keep_original_media: bool,
 }
 
 #[derive(Debug)]
@@ -5508,6 +5701,7 @@ struct MonitoredRecording {
     started_at: String,
     pipeline: RecordingPipeline,
     captioned_copy_requested: bool,
+    keep_original_media: bool,
     native_audio_stats: Option<NativeAudioStats>,
 }
 
@@ -5924,12 +6118,13 @@ async fn await_recording_camera_cadence_ready(
     let threshold_ms = camera_cadence_ready_threshold_ms(target_fps);
 
     loop {
-        let (sample_pts_gap_p95_ms, callback_gap_p95_ms, frame_age_ms) = {
+        let (sample_pts_gap_p95_ms, callback_gap_p95_ms, frame_age_ms, camera_source_fps) = {
             let diagnostics = state.diagnostics.lock().await;
             (
                 diagnostics.preview_camera_sample_pts_gap_p95_ms,
                 diagnostics.preview_camera_capture_gap_p95_ms,
                 diagnostics.preview_camera_frame_age_ms,
+                diagnostics.preview_camera_source_fps,
             )
         };
 
@@ -5945,13 +6140,29 @@ async fn await_recording_camera_cadence_ready(
                 HealthLevel::Info,
                 "recording-camera-cadence-ready",
                 &format!(
-                    "Camera cadence settled before recording start: sample PTS p95 {} (threshold {:.0}ms), callback p95 {}, frame age {}.",
+                    "Camera cadence settled before recording start: sample PTS p95 {} (threshold {:.0}ms), callback p95 {}, frame age {}, measured delivery {}.",
                     optional_ms(sample_pts_gap_p95_ms),
                     threshold_ms,
                     optional_ms(callback_gap_p95_ms),
-                    optional_u64_ms(frame_age_ms)
+                    optional_u64_ms(frame_age_ms),
+                    camera_source_fps
+                        .filter(|fps| fps.is_finite())
+                        .map(|fps| format!("{fps:.2}fps"))
+                        .unwrap_or_else(|| "n/a".to_string())
                 ),
             );
+            // A settled cadence can still be the WRONG cadence (camera feeding 24p
+            // into a 30fps session). Warn — loudly enough to toast — but never block:
+            // the recording is still usable, just not smooth.
+            if let Some(warning) = camera_cadence_mismatch_warning(camera_source_fps, target_fps) {
+                let _ = emit_health_event(
+                    state,
+                    Some(session_id),
+                    HealthLevel::Warn,
+                    "camera-cadence-mismatch",
+                    &warning,
+                );
+            }
             return Ok(());
         }
 
@@ -6008,6 +6219,38 @@ fn camera_cadence_ready(
 
 fn camera_cadence_ready_threshold_ms(target_fps: u32) -> f64 {
     1000.0 / f64::from(target_fps.max(1)) * RECORDING_CAMERA_CADENCE_FRAME_INTERVAL_FACTOR
+}
+
+/// The camera can be healthy (steady cadence, fresh frames) yet deliver a DIFFERENT
+/// rate than the session targets — e.g. an HDMI capture card relaying a mirrorless
+/// set to 24p into a 30fps session. The pipeline then repeats the stale camera frame
+/// on ~every fifth tick and recorded motion visibly stutters, with no error anywhere.
+/// (Found in the 2026-07 "4K feels laggy" incident: Cam Link 4K delivering 23.976
+/// while everything intended 30.)
+///
+/// Returns an actionable warning when the measured delivery rate deviates more than
+/// `CAMERA_CADENCE_MISMATCH_TOLERANCE_PCT` from the session rate. The NTSC offset
+/// (29.97 vs 30) stays within tolerance by construction.
+const CAMERA_CADENCE_MISMATCH_TOLERANCE_PCT: f64 = 2.0;
+
+fn camera_cadence_mismatch_warning(measured_fps: Option<f64>, target_fps: u32) -> Option<String> {
+    let measured = measured_fps.filter(|fps| fps.is_finite() && *fps > 0.0)?;
+    let target = f64::from(target_fps.max(1));
+    let deviation_pct = (measured - target).abs() / target * 100.0;
+    if deviation_pct <= CAMERA_CADENCE_MISMATCH_TOLERANCE_PCT {
+        return None;
+    }
+    let per_second = (target - measured).abs().round() as u64;
+    let effect = if measured < target {
+        format!("~{per_second} repeated (stuttering) frame(s) per second in the recording")
+    } else {
+        format!("~{per_second} camera frame(s) per second will be dropped")
+    };
+    Some(format!(
+        "Camera is delivering ~{measured:.2} fps but the session is set to {target_fps} fps — \
+         expect {effect}. Set the camera/HDMI output to {target_fps}p, or match the session \
+         frame rate to the camera."
+    ))
 }
 
 fn recording_startup_frame_gap_budget(target_fps: u32) -> Duration {
@@ -6123,19 +6366,111 @@ enum FfmpegH264Platform {
 
 #[cfg(target_os = "windows")]
 static WINDOWS_MEDIA_FOUNDATION_HARDWARE_SELECTED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "windows")]
+#[cfg(any(test, target_os = "windows"))]
 static WINDOWS_MEDIA_FOUNDATION_PROBE_CACHE: std::sync::OnceLock<
-    StdMutex<std::collections::HashMap<WindowsMediaFoundationProbeKey, bool>>,
+    StdMutex<
+        std::collections::HashMap<
+            WindowsMediaFoundationProbeKey,
+            WindowsMediaFoundationProbeOutcome,
+        >,
+    >,
 > = std::sync::OnceLock::new();
+
+/// Cached hardware verdict for one capability key, if any. Failures are
+/// cached exactly like successes: a rejected probe must not re-run FFmpeg on
+/// every session start with the same binary + profile.
+#[cfg(any(test, target_os = "windows"))]
+fn windows_media_foundation_cached_outcome(
+    key: &WindowsMediaFoundationProbeKey,
+) -> Option<WindowsMediaFoundationProbeOutcome> {
+    WINDOWS_MEDIA_FOUNDATION_PROBE_CACHE
+        .get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(key).cloned())
+}
+
+#[cfg(any(test, target_os = "windows"))]
+fn windows_media_foundation_store_outcome(
+    key: WindowsMediaFoundationProbeKey,
+    outcome: WindowsMediaFoundationProbeOutcome,
+) {
+    if let Ok(mut cache) = WINDOWS_MEDIA_FOUNDATION_PROBE_CACHE
+        .get_or_init(|| StdMutex::new(std::collections::HashMap::new()))
+        .lock()
+    {
+        cache.insert(key, outcome);
+    }
+}
 
 #[cfg(any(test, target_os = "windows"))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct WindowsMediaFoundationProbeKey {
     ffmpeg_path: PathBuf,
+    /// Byte length + mtime of the FFmpeg binary: app updates replace the
+    /// bundled ffmpeg IN PLACE, so the path alone would let a stale hardware
+    /// verdict outlive the binary that produced it (Plan 035 maintenance
+    /// note: the capability key must include the bundled FFmpeg version).
+    ffmpeg_len: Option<u64>,
+    ffmpeg_modified_ms: Option<u128>,
     width: u32,
     height: u32,
     fps: u32,
     bitrate_kbps: u32,
+}
+
+/// One cached hardware-capability verdict for a probe key. `reason` carries
+/// the EXACT failure evidence (exit status + stderr tail) so every session
+/// that falls back logs why, not just that it did.
+#[cfg(any(test, target_os = "windows"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsMediaFoundationProbeOutcome {
+    accepted: bool,
+    reason: Option<String>,
+}
+
+/// The exact fallback reason recorded when the tee-backed probe rejects the
+/// hardware encoder. Bounded: only the stderr tail rides along, and control
+/// characters are stripped so the reason stays one loggable line.
+#[cfg(any(test, target_os = "windows"))]
+fn windows_media_foundation_fallback_reason(
+    exit_code: Option<i32>,
+    stderr: &str,
+    timed_out: bool,
+) -> String {
+    const STDERR_TAIL_MAX: usize = 400;
+    if timed_out {
+        return "tee-backed hardware probe timed out".to_string();
+    }
+    let cleaned: String = stderr
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let tail = if cleaned.len() > STDERR_TAIL_MAX {
+        let start = cleaned.len() - STDERR_TAIL_MAX;
+        let boundary = (start..cleaned.len())
+            .find(|index| cleaned.is_char_boundary(*index))
+            .unwrap_or(cleaned.len());
+        format!("…{}", &cleaned[boundary..])
+    } else {
+        cleaned
+    };
+    let status = match exit_code {
+        Some(code) => format!("exit code {code}"),
+        None => "terminated by signal".to_string(),
+    };
+    if tail.is_empty() {
+        format!("tee-backed hardware probe failed ({status})")
+    } else {
+        format!("tee-backed hardware probe failed ({status}): {tail}")
+    }
 }
 
 #[cfg(any(test, target_os = "windows"))]
@@ -6144,8 +6479,18 @@ fn windows_media_foundation_probe_key(
     video: &VideoSettings,
 ) -> WindowsMediaFoundationProbeKey {
     let path = PathBuf::from(ffmpeg_path);
+    let metadata = std::fs::metadata(&path).ok();
     WindowsMediaFoundationProbeKey {
         ffmpeg_path: std::fs::canonicalize(&path).unwrap_or(path),
+        ffmpeg_len: metadata.as_ref().map(std::fs::Metadata::len),
+        ffmpeg_modified_ms: metadata.and_then(|metadata| {
+            metadata
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+                .map(|duration| duration.as_millis())
+        }),
         width: video.width,
         height: video.height,
         fps: video.fps,
@@ -6194,9 +6539,14 @@ fn ffmpeg_h264_encoder(platform: FfmpegH264Platform) -> FfmpegH264Encoder {
             backend: EncodeBackend::HardwareMediaFoundation,
         },
         FfmpegH264Platform::WindowsSoftware => FfmpegH264Encoder {
-            codec: "h264_mf",
-            pix_fmt: "nv12",
-            backend: EncodeBackend::SoftwareMediaFoundation,
+            // Issue #149 (real device): software h264_mf ran at 0.86x realtime
+            // at 1080p30 and stalled the raw pipe; the bundled ffmpeg's
+            // libopenh264 measured ~2.5x realtime on the same box. OpenH264 is
+            // the reliable software fallback; hardware Media Foundation stays
+            // the probed fast path.
+            codec: "libopenh264",
+            pix_fmt: "yuv420p",
+            backend: EncodeBackend::SoftwareOpenH264,
         },
         FfmpegH264Platform::Other => FfmpegH264Encoder {
             codec: "libx264",
@@ -6208,7 +6558,7 @@ fn ffmpeg_h264_encoder(platform: FfmpegH264Platform) -> FfmpegH264Encoder {
 
 #[cfg(any(test, target_os = "windows"))]
 fn windows_media_foundation_hardware_probe_args(video: &VideoSettings) -> Vec<String> {
-    vec![
+    let mut args = vec![
         "-hide_banner".to_string(),
         "-loglevel".to_string(),
         "error".to_string(),
@@ -6224,97 +6574,133 @@ fn windows_media_foundation_hardware_probe_args(video: &VideoSettings) -> Vec<St
         "-frames:v".to_string(),
         "3".to_string(),
         "-an".to_string(),
-        "-pix_fmt".to_string(),
-        "nv12".to_string(),
-        "-c:v".to_string(),
-        "h264_mf".to_string(),
-        "-hw_encoding".to_string(),
-        "1".to_string(),
-        "-rate_control".to_string(),
-        "ld_vbr".to_string(),
-        "-scenario".to_string(),
-        "live_streaming".to_string(),
-        "-b:v".to_string(),
-        format!("{}k", video.bitrate_kbps.max(1)),
-        "-f".to_string(),
-        "null".to_string(),
-        "-".to_string(),
-    ]
+    ];
+    // Keep this probe identical to the production encoding profile. A partial
+    // probe can accept a hardware encoder that fails once the actual rate
+    // control, GOP, and header settings are applied.
+    append_h264_encoding_args_for_platform(
+        &mut args,
+        video,
+        FfmpegH264Platform::WindowsHardware,
+        true,
+    );
+    // Plan 035 / issue #156: h264_mf has PASSED a null-output probe and then
+    // failed during TEE header creation in production. Exercise the exact
+    // record+stream tee topology — same fifo isolation, same matroska and
+    // FLV slave shapes — against the null device, so a probe pass proves the
+    // headers, codec tags, and rate control the real session will use.
+    let null_device = if cfg!(target_os = "windows") {
+        "NUL"
+    } else {
+        "/dev/null"
+    };
+    args.extend(tee_output_args(format!(
+        "[f=matroska:onfail=abort]{null_device}|[f=flv:onfail=ignore:flvflags=no_duration_filesize]{null_device}"
+    )));
+    args
 }
 
+#[cfg(target_os = "windows")]
+const WINDOWS_MEDIA_FOUNDATION_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Per-session, capability-keyed hardware selection (Plan 035 / issue #156).
+/// The hardware Media Foundation encoder is chosen only after the tee-backed
+/// probe proved the production headers, rate control, and output topology on
+/// this exact FFmpeg binary and output profile; anything else selects the
+/// OpenH264 fallback and logs the exact reason. Verdicts are cached by
+/// capability key, so one probe covers every later session with the same
+/// binary + profile and a changed binary or profile re-proves itself.
 #[cfg(target_os = "windows")]
 async fn select_windows_media_foundation_encoder(
     state: &AppState,
     ffmpeg_path: &str,
     video: &VideoSettings,
 ) {
-    let probe_key = windows_media_foundation_probe_key(ffmpeg_path, video);
-    let probe_cache = WINDOWS_MEDIA_FOUNDATION_PROBE_CACHE
-        .get_or_init(|| StdMutex::new(std::collections::HashMap::new()));
-    if let Some(hardware_selected) = probe_cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .get(&probe_key)
-        .copied()
-    {
-        WINDOWS_MEDIA_FOUNDATION_HARDWARE_SELECTED.store(hardware_selected, Ordering::Relaxed);
+    let key = windows_media_foundation_probe_key(ffmpeg_path, video);
+    let (outcome, freshly_probed) = match windows_media_foundation_cached_outcome(&key) {
+        Some(outcome) => (outcome, false),
+        None => {
+            let outcome = run_windows_media_foundation_hardware_probe(ffmpeg_path, video).await;
+            windows_media_foundation_store_outcome(key, outcome.clone());
+            (outcome, true)
+        }
+    };
+    WINDOWS_MEDIA_FOUNDATION_HARDWARE_SELECTED.store(outcome.accepted, Ordering::Relaxed);
+    if outcome.accepted {
+        if freshly_probed {
+            state.emit_log(
+                "info",
+                "Hardware Media Foundation H.264 selected: the tee-backed probe proved production headers, rate control, and tee topology.",
+            );
+        }
+    } else {
+        let reason = outcome
+            .reason
+            .as_deref()
+            .unwrap_or("tee-backed hardware probe was rejected");
         state.emit_log(
-            "info",
-            if hardware_selected {
-                "Using the cached Media Foundation hardware H.264 probe result."
-            } else {
-                "Using the cached Media Foundation software H.264 fallback result."
-            },
+            "warn",
+            format!("Using the OpenH264 software H.264 fallback: {reason}"),
         );
-        return;
     }
+}
+
+#[cfg(target_os = "windows")]
+async fn run_windows_media_foundation_hardware_probe(
+    ffmpeg_path: &str,
+    video: &VideoSettings,
+) -> WindowsMediaFoundationProbeOutcome {
+    let args = windows_media_foundation_hardware_probe_args(video);
     let mut command = Command::new(ffmpeg_path);
     command
-        .args(windows_media_foundation_hardware_probe_args(video))
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let probe = timeout(Duration::from_secs(8), command.output()).await;
-    let (hardware_selected, detail) = match probe {
-        Ok(Ok(output)) if output.status.success() => (
-            true,
-            format!(
-                "Media Foundation hardware H.264 passed the {}x{}@{} startup probe.",
-                video.width, video.height, video.fps
-            ),
-        ),
-        Ok(Ok(output)) => {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            (
-                false,
-                format!(
-                    "Media Foundation hardware H.264 was unavailable for {}x{}@{} ({}); using the software MFT fallback.",
-                    video.width,
-                    video.height,
-                    video.fps,
-                    stderr.trim().chars().take(240).collect::<String>()
-                ),
-            )
+        .stderr(Stdio::piped());
+    command.kill_on_drop(true);
+    let spawned = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return WindowsMediaFoundationProbeOutcome {
+                accepted: false,
+                reason: Some(format!(
+                    "tee-backed hardware probe could not start FFmpeg: {error}"
+                )),
+            };
         }
-        Ok(Err(error)) => (
-            false,
-            format!(
-                "Media Foundation hardware H.264 probe could not start ({error}); using the software MFT fallback."
-            ),
-        ),
-        Err(_) => (
-            false,
-            "Media Foundation hardware H.264 probe timed out; using the software MFT fallback."
-                .to_string(),
-        ),
     };
-    probe_cache
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(probe_key, hardware_selected);
-    WINDOWS_MEDIA_FOUNDATION_HARDWARE_SELECTED.store(hardware_selected, Ordering::Relaxed);
-    state.emit_log(if hardware_selected { "info" } else { "warn" }, &detail);
+    match timeout(
+        WINDOWS_MEDIA_FOUNDATION_PROBE_TIMEOUT,
+        spawned.wait_with_output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) => {
+            if output.status.success() {
+                WindowsMediaFoundationProbeOutcome {
+                    accepted: true,
+                    reason: None,
+                }
+            } else {
+                WindowsMediaFoundationProbeOutcome {
+                    accepted: false,
+                    reason: Some(windows_media_foundation_fallback_reason(
+                        output.status.code(),
+                        &String::from_utf8_lossy(&output.stderr),
+                        false,
+                    )),
+                }
+            }
+        }
+        Ok(Err(error)) => WindowsMediaFoundationProbeOutcome {
+            accepted: false,
+            reason: Some(format!("tee-backed hardware probe failed to run: {error}")),
+        },
+        Err(_) => WindowsMediaFoundationProbeOutcome {
+            accepted: false,
+            reason: Some(windows_media_foundation_fallback_reason(None, "", true)),
+        },
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -6329,19 +6715,26 @@ fn default_h264_encode_backend() -> EncodeBackend {
     ffmpeg_h264_encoder(current_ffmpeg_h264_platform()).backend
 }
 
-fn append_h264_encoding_args(args: &mut Vec<String>, video: &VideoSettings) {
-    append_h264_encoding_args_for_platform(args, video, current_ffmpeg_h264_platform());
+fn append_h264_encoding_args(args: &mut Vec<String>, video: &VideoSettings, low_latency: bool) {
+    append_h264_encoding_args_for_platform(
+        args,
+        video,
+        current_ffmpeg_h264_platform(),
+        low_latency,
+    );
 }
 
 fn append_h264_encoding_args_preserving_input_timestamps(
     args: &mut Vec<String>,
     video: &VideoSettings,
+    low_latency: bool,
 ) {
     append_h264_encoding_args_for_platform_with_timing(
         args,
         video,
         current_ffmpeg_h264_platform(),
         false,
+        low_latency,
     );
     args.extend(["-fps_mode".to_string(), "vfr".to_string()]);
 }
@@ -6350,8 +6743,9 @@ fn append_h264_encoding_args_for_platform(
     args: &mut Vec<String>,
     video: &VideoSettings,
     platform: FfmpegH264Platform,
+    low_latency: bool,
 ) {
-    append_h264_encoding_args_for_platform_with_timing(args, video, platform, true);
+    append_h264_encoding_args_for_platform_with_timing(args, video, platform, true, low_latency);
 }
 
 fn append_h264_encoding_args_for_platform_with_timing(
@@ -6359,6 +6753,7 @@ fn append_h264_encoding_args_for_platform_with_timing(
     video: &VideoSettings,
     platform: FfmpegH264Platform,
     force_output_fps: bool,
+    low_latency: bool,
 ) {
     let encoder = ffmpeg_h264_encoder(platform);
     if force_output_fps {
@@ -6377,9 +6772,15 @@ fn append_h264_encoding_args_for_platform_with_timing(
                 "1".to_string(),
                 "-realtime".to_string(),
                 "1".to_string(),
-                "-prio_speed".to_string(),
-                "1".to_string(),
             ]);
+            // Speed-over-quality is a STREAMING posture; a record-only
+            // output inside the proven ≤1440p envelope lets VideoToolbox
+            // spend its headroom on quality (capture still paces the encoder
+            // via -realtime). 4K keeps the speed posture — quality-mode 4K
+            // warmup falls behind realtime (0.9.44 owner incident).
+            if low_latency || !quality_posture_canvas_envelope(video.width, video.height) {
+                args.extend(["-prio_speed".to_string(), "1".to_string()]);
+            }
         }
         FfmpegH264Platform::WindowsHardware => {
             args.extend(["-hw_encoding".to_string(), "1".to_string()]);
@@ -6391,14 +6792,14 @@ fn append_h264_encoding_args_for_platform_with_timing(
             ]);
         }
         FfmpegH264Platform::WindowsSoftware => {
-            // Keep the low-delay Media Foundation profile, but let the encoder
-            // select its software implementation only after the exact hardware
-            // probe failed for this output profile.
+            // libopenh264 tuned per the #149 real-device benchmark (~2.5x
+            // realtime at 1080p30/8Mbps on the bundled build): bitrate rate
+            // control with frame-skip permitted only under overshoot.
             args.extend([
-                "-rate_control".to_string(),
-                "ld_vbr".to_string(),
-                "-scenario".to_string(),
-                "live_streaming".to_string(),
+                "-rc_mode".to_string(),
+                "bitrate".to_string(),
+                "-allow_skip_frames".to_string(),
+                "1".to_string(),
             ]);
         }
         FfmpegH264Platform::Other => {
@@ -6409,6 +6810,21 @@ fn append_h264_encoding_args_for_platform_with_timing(
                 "zerolatency".to_string(),
             ]);
         }
+    }
+    // Spec-valid High profile/level (the recording-quality audit caught the
+    // encoders' auto picks under-leveling 60fps streams). Media Foundation
+    // exposes neither option, so the Windows arms keep the encoder default.
+    if matches!(
+        platform,
+        FfmpegH264Platform::Macos | FfmpegH264Platform::Other
+    ) && let Some(level) = h264_high_level_label(video.width, video.height, video.fps)
+    {
+        args.extend([
+            "-profile:v".to_string(),
+            "high".to_string(),
+            "-level".to_string(),
+            level.to_string(),
+        ]);
     }
     args.extend([
         "-b:v".to_string(),
@@ -6426,6 +6842,25 @@ fn append_h264_encoding_args_for_platform_with_timing(
         "-flags".to_string(),
         "+global_header".to_string(),
     ]);
+    args.extend(h264_bt709_color_tag_args());
+}
+
+/// Recording colorimetry law: every ffmpeg-encoded leg TAGS BT.709
+/// video-range in the bitstream. The bytes match: bridge raw video is
+/// converted by `color::rgb_to_yuv_video_range_bt709`, and the legacy
+/// composed graph converts through `scale=out_color_matrix=bt709` (see
+/// `recording_video_filter`).
+fn h264_bt709_color_tag_args() -> [String; 8] {
+    [
+        "-colorspace".to_string(),
+        "bt709".to_string(),
+        "-color_primaries".to_string(),
+        "bt709".to_string(),
+        "-color_trc".to_string(),
+        "bt709".to_string(),
+        "-color_range".to_string(),
+        "tv".to_string(),
+    ]
 }
 
 fn compositor_backend_label(backend: Option<CompositorBackend>) -> &'static str {
@@ -6442,6 +6877,7 @@ fn encode_backend_label(backend: Option<EncodeBackend>) -> &'static str {
         Some(EncodeBackend::HardwareVideotoolbox) => "hardware-videotoolbox",
         Some(EncodeBackend::HardwareMediaFoundation) => "hardware-media-foundation",
         Some(EncodeBackend::SoftwareMediaFoundation) => "software-media-foundation",
+        Some(EncodeBackend::SoftwareOpenH264) => "software-open-h264",
         Some(EncodeBackend::SoftwareX264) => "software-x264",
         None => "unknown",
     }
@@ -6633,6 +7069,23 @@ fn tee_output_args(spec: String) -> Vec<String> {
     ]
 }
 
+/// Record-only 60fps recordings ride the encoder bridge up to 1440p (the
+/// perf-gated envelope): same compositor the preview shows, VideoToolbox
+/// session, epoch-trimmed start, and bounded stop. 4K60 (experimental) and
+/// any >30fps STREAMING profile keep the legacy path until they have their
+/// own perf evidence.
+fn record_only_bridge_60fps_eligible(params: &StartSessionParams) -> bool {
+    if params.output.stream_enabled {
+        return false;
+    }
+    if params.output.video.fps > 60 {
+        return false;
+    }
+    let long_side = params.output.video.width.max(params.output.video.height);
+    let short_side = params.output.video.width.min(params.output.video.height);
+    long_side <= 2560 && short_side <= 1440
+}
+
 async fn should_use_compositor_encoder_bridge(
     state: &AppState,
     params: &StartSessionParams,
@@ -6648,8 +7101,11 @@ async fn should_use_compositor_encoder_bridge(
         // Explicit developer env override — the only sanctioned legacy escape hatch.
         return Ok(false);
     }
-    if params.output.video.fps > 30 {
-        // >30fps still rides the legacy path by design (bridge cap); not silent —
+    if params.output.video.fps > 30 && !record_only_bridge_60fps_eligible(params) {
+        // The bridge cap: >30fps rides the legacy path EXCEPT record-only
+        // sessions up to 1440p60, which now get the same WYSIWYG compositor +
+        // VideoToolbox + epoch-trim pipeline as 30fps (recording-quality plan
+        // Q2). Streaming >30fps and 4K60 keep the legacy path; not silent —
         // the session log records it below at the call site.
         return Ok(false);
     }
@@ -6956,6 +7412,7 @@ fn bridge_compositor_ffmpeg_args(
                 append_h264_encoding_args_preserving_input_timestamps(
                     &mut args,
                     &params.output.video,
+                    !stream_targets.is_empty(),
                 );
             }
             EncoderBridgeVideoOutput::VideoToolboxH264AnnexB
@@ -6983,7 +7440,7 @@ fn bridge_compositor_ffmpeg_args(
         .collect::<Vec<_>>();
 
     match (output_path, stream_targets) {
-        (Some(path), []) => args.push(path.display().to_string()),
+        (Some(path), []) => args.push(ffmpeg_file_path(path)),
         (Some(path), _) if copy_stream_fanout => {
             append_bridge_copy_file_output(&mut args, &input_layout, &params.audio, true, path);
             for target in stream_targets {
@@ -6999,7 +7456,7 @@ fn bridge_compositor_ffmpeg_args(
         (Some(path), _) => {
             let mut legs = vec![format!(
                 "[f=matroska:onfail=abort]{}",
-                escape_tee_target(&path.display().to_string())
+                escape_tee_target(&ffmpeg_file_path(path))
             )];
             legs.extend(stream_legs);
             args.extend(tee_output_args(legs.join("|")));
@@ -7103,7 +7560,7 @@ fn bridge_compositor_split_output_ffmpeg_args(
     ]);
     append_audio_encoding_args(&mut args, &input_layout, &params.audio, true);
     args.push("-shortest".to_string());
-    args.push(output_path.display().to_string());
+    args.push(ffmpeg_file_path(output_path));
 
     let stream_input_layout = InputLayout {
         video_input_index: stream_video_input_index,
@@ -7351,7 +7808,7 @@ fn append_bridge_copy_file_output(
     path: &Path,
 ) {
     append_bridge_copy_output_args(args, input_layout, audio, streaming_audio);
-    args.push(path.display().to_string());
+    args.push(ffmpeg_file_path(path));
 }
 
 fn append_bridge_copy_flv_output(
@@ -7489,7 +7946,7 @@ fn ffmpeg_args(
         "[v_main]".to_string(),
     ]);
     append_audio_output_args(&mut args, &input_layout);
-    append_h264_encoding_args(&mut args, &params.output.video);
+    append_h264_encoding_args(&mut args, &params.output.video, !stream_targets.is_empty());
     append_audio_encoding_args(
         &mut args,
         &input_layout,
@@ -7509,14 +7966,14 @@ fn ffmpeg_args(
 
     match (output_path, stream_targets) {
         // Local recording only.
-        (Some(path), []) => args.push(path.display().to_string()),
+        (Some(path), []) => args.push(ffmpeg_file_path(path)),
         // Local recording + one or more streams: tee the MKV (onfail=abort) and
         // every RTMP leg (onfail=ignore so a failing platform does not kill the
         // recording or the other streams).
         (Some(path), _) => {
             let mut legs = vec![format!(
                 "[f=matroska:onfail=abort]{}",
-                escape_tee_target(&path.display().to_string())
+                escape_tee_target(&ffmpeg_file_path(path))
             )];
             legs.extend(stream_legs);
             args.extend(tee_output_args(legs.join("|")));
@@ -7567,7 +8024,7 @@ fn preview_ffmpeg_args(
         "4".to_string(),
         "-update".to_string(),
         "1".to_string(),
-        output_path.display().to_string(),
+        ffmpeg_file_path(output_path),
     ]);
     Ok(args)
 }
@@ -8102,10 +8559,15 @@ fn ffmpeg_live_audio_stop_mode(use_encoder_bridge: bool) -> FfmpegLiveAudioStopM
 
 fn parse_ffmpeg_filter_command_reply(line: &str) -> Option<FfmpegFilterCommandReply> {
     let line = line.trim();
-    if !line.starts_with("Command reply for stream ") {
-        return None;
-    }
-    let value = line.split_once("ret:")?.1.split_whitespace().next()?;
+    // FFmpeg's interactive command response shares stderr with progress and
+    // stats output. On Windows those writes can overwrite or prefix the start
+    // of the response line, while the stable `for stream ... ret:` suffix
+    // remains intact. Parse that suffix so a successful audio acknowledgement
+    // is not lost and replaced by an unrelated video-graph rejection.
+    let reply = line.rsplit_once("for stream ")?.1;
+    let (stream_index, result) = reply.split_once(": ret:")?;
+    stream_index.parse::<i32>().ok()?;
+    let value = result.split_whitespace().next()?;
     Some(FfmpegFilterCommandReply {
         return_code: value.parse().ok()?,
     })
@@ -8246,13 +8708,21 @@ fn recording_video_filter(
     } else {
         "v"
     };
+    // The recording leg converts to yuv420p HERE, explicitly BT.709
+    // video-range, so the bytes match the `-colorspace bt709` tags the encode
+    // args write (an implicit conversion at the encoder would use swscale's
+    // untagged default matrix instead). `setparams` additionally stamps
+    // primaries/transfer on the frames: hardware encoders (h264_videotoolbox)
+    // build the VUI from frame properties and `scale` only sets matrix+range.
+    // The preview leg stays unconverted.
+    let to_bt709 = "scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,format=yuv420p";
     if include_live_preview {
         format!(
-            "{video};[{video_label}]split=2[v_main][v_preview];[v_preview]{}[preview]",
+            "{video};[{video_label}]split=2[v_main_rgb][v_preview];[v_main_rgb]{to_bt709}[v_main];[v_preview]{}[preview]",
             recording_preview_scale_filter()
         )
     } else {
-        format!("{video};[{video_label}]null[v_main]")
+        format!("{video};[{video_label}]{to_bt709}[v_main]")
     }
 }
 
@@ -8429,21 +8899,31 @@ fn scene_source_layer_filter(
     )
 }
 
-/// FFmpeg mirror of the shared keyer (`scene_geometry::camera_chroma_key`):
-/// `chromakey` computes the same CbCr-plane distance normalized to the plane's
-/// diagonal (255·√2), so `similarity`/`blend` are exactly the spec's
-/// threshold/band divided by that constant, and `despill`'s `mix` is the spill
-/// strength. Empty when keying is off. Trailing comma composes into chains.
+/// Chroma saturation of a typical studio-lit screen — the anchor for the
+/// FFmpeg leg's calibrated approximation of the angle keyer (real screens
+/// measured at 35–62 units; see the realistic-palette test).
+const FFMPEG_CHROMA_KEY_REFERENCE_SATURATION: f64 = 55.0;
+
+/// FFmpeg approximation of the shared ANGLE keyer. `chromakey` can only
+/// express absolute CbCr distance, and a per-pixel `geq` keyer is too slow at
+/// full frame — so this leg anchors an EFFECTIVE key color at the spec's
+/// chroma direction scaled to a realistic screen saturation (not the pure
+/// preset color, whose saturation ~136 put real screens 75+ units away — the
+/// 0.9.39 bug), with a similarity radius that covers the screen cluster at
+/// the spec's angle. The Metal/CPU paths key by true angle; this bounded
+/// divergence is pinned by `ffmpeg_chroma_mapping_keys_the_realistic_palette`.
 fn camera_chroma_key_filter(layout: &LayoutSettings) -> String {
     let Some(spec) = camera_chroma_key(layout) else {
         return String::new();
     };
-    let [r, g, b] = spec.key_rgb;
+    let Some((effective_rgb, similarity_units)) = ffmpeg_chroma_key_mapping(&spec) else {
+        return String::new();
+    };
+    let [r, g, b] = effective_rgb;
     let normalize = 255.0 * std::f64::consts::SQRT_2;
-    // chromakey rejects similarity 0; the floor keeps a zero threshold keying
-    // only exact key pixels, matching the reference's hard edge.
-    let similarity = (spec.threshold / normalize).clamp(0.0001, 1.0);
-    let blend = (spec.band / normalize).clamp(0.0, 1.0);
+    let similarity = (similarity_units / normalize).clamp(0.01, 1.0);
+    let blend = (spec.band_deg.to_radians() * FFMPEG_CHROMA_KEY_REFERENCE_SATURATION / normalize)
+        .clamp(0.0, 1.0);
     let despill = if spec.spill > 0.0 {
         let kind = if spec.spill_is_blue() {
             "blue"
@@ -8457,6 +8937,32 @@ fn camera_chroma_key_filter(layout: &LayoutSettings) -> String {
     format!(
         "chromakey=color=0x{r:02X}{g:02X}{b:02X}:similarity={similarity:.4}:blend={blend:.4}{despill},"
     )
+}
+
+/// Effective key color + similarity radius (CbCr units) for the chromakey
+/// approximation: the key DIRECTION at reference saturation, with a radius
+/// covering saturation spread (±20 units around the reference) plus the
+/// angular cone at that saturation.
+fn ffmpeg_chroma_key_mapping(
+    spec: &crate::scene_geometry::ChromaKeySpec,
+) -> Option<([u8; 3], f64)> {
+    let (dir_cb, dir_cr) = spec.key_direction()?;
+    let cb = 128.0 + dir_cb * FFMPEG_CHROMA_KEY_REFERENCE_SATURATION;
+    let cr = 128.0 + dir_cr * FFMPEG_CHROMA_KEY_REFERENCE_SATURATION;
+    // Full-range BT.601 inverse at mid luma; chromakey compares CbCr only,
+    // so the Y channel of the encoded color is irrelevant.
+    let y = 128.0;
+    let red = (y + 1.402 * (cr - 128.0)).clamp(0.0, 255.0).round() as u8;
+    let green = (y - 0.344136 * (cb - 128.0) - 0.714136 * (cr - 128.0))
+        .clamp(0.0, 255.0)
+        .round() as u8;
+    let blue = (y + 1.772 * (cb - 128.0)).clamp(0.0, 255.0).round() as u8;
+    // Radius: saturation spread of a real screen around the reference plus
+    // the chord of the angle cone at reference saturation.
+    let angular_reach =
+        FFMPEG_CHROMA_KEY_REFERENCE_SATURATION * spec.max_angle_deg.to_radians().sin();
+    let similarity_units = 20.0 + angular_reach;
+    Some(([red, green, blue], similarity_units))
 }
 
 fn normalized_crop_filter(transform: &crate::protocol::SceneTransform) -> String {
@@ -9541,6 +10047,14 @@ fn require_video_profile(
         || video.fps != fps
         || video.bitrate_kbps != bitrate_kbps
     {
+        // 4K60 has no custom escape hatch (custom 4K60 is itself rejected by
+        // the experimental gate), so pointing at the custom preset here sent
+        // users in a circle. Its values are simply fixed.
+        if matches!(video.preset, VideoPreset::Record4k60Experimental) {
+            bail!(
+                "Record 4K60 (experimental) uses fixed values: {width}x{height}@{fps} at {bitrate_kbps}kbps. To adjust quality, choose a non-experimental preset such as record-4k30."
+            );
+        }
         bail!(
             "Video preset {:?} must be {}x{}@{} {}kbps; edit values under the custom preset.",
             video.preset,
@@ -9595,11 +10109,28 @@ fn redact_stream_url(url: &str) -> String {
     }
 }
 
+/// Converts an application-owned filesystem path into the spelling FFmpeg accepts.
+/// Windows file APIs use the `\\?\` namespace for long-path safety, but FFmpeg's
+/// tee muxer treats that prefix as an invalid slave filename. Keep verbatim paths
+/// internally and remove the namespace only at the subprocess boundary.
+fn ffmpeg_file_path(path: &Path) -> String {
+    let path = path.display().to_string();
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(unc_path) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{unc_path}");
+        }
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_string()
+    }
+    #[cfg(not(target_os = "windows"))]
+    path
+}
+
 fn escape_tee_target(target: &str) -> String {
     // The tee muxer uses `|` to separate slave outputs and `[]` for per-output
     // options; backslash-escape those so URLs/paths cannot break the filtergraph.
     target
-        .replace('\\', "\\\\")
+        .replace('\\', "\\\\\\\\")
         .replace('|', "\\|")
         .replace('[', "\\[")
         .replace(']', "\\]")
@@ -10417,6 +10948,42 @@ mod tests {
         assert_eq!(session_title(&started_at, &Utc), "Session 2026-07-06 10:13");
     }
 
+    fn long_running_capture_command() -> Command {
+        #[cfg(target_os = "windows")]
+        {
+            let mut command = Command::new("cmd");
+            command.args(["/C", "ping", "-n", "30", "127.0.0.1"]);
+            command
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut command = Command::new("sleep");
+            command.arg("30");
+            command
+        }
+    }
+
+    #[tokio::test]
+    async fn uncommitted_capture_process_terminates_child_on_drop() {
+        let mut command = long_running_capture_command();
+        command.kill_on_drop(true);
+        let child = spawn_owned_tokio(&mut command).expect("spawn capture child");
+        let pid = child.id().expect("capture child pid");
+
+        drop(UncommittedCaptureProcess::new(child, Vec::new()));
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                if !crate::process_job::process_is_running(pid).expect("probe capture child") {
+                    return;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("uncommitted capture child terminates");
+    }
     #[test]
     fn screen_overlay_writer_honors_stop_before_writing_frame() {
         let path = std::env::temp_dir().join(format!(
@@ -10618,6 +11185,69 @@ mod tests {
     }
 
     #[test]
+    fn h264_encoder_args_write_spec_valid_level_and_bt709_tags() {
+        // The audit's headline defects: 60fps artifacts shipped with
+        // under-spec level tags and no colorimetry at all. Every ffmpeg
+        // encode leg now pins both.
+        let video_1080p60 = VideoSettings {
+            preset: VideoPreset::Custom,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps: 12_000,
+        };
+        let mut macos_args = Vec::new();
+        append_h264_encoding_args_for_platform(
+            &mut macos_args,
+            &video_1080p60,
+            FfmpegH264Platform::Macos,
+            false,
+        );
+        assert_eq!(arg_value(&macos_args, "-profile:v"), Some("high"));
+        // Record-only drops the speed-over-quality hint; -realtime stays.
+        assert_eq!(arg_value(&macos_args, "-prio_speed"), None);
+        assert_eq!(arg_value(&macos_args, "-realtime"), Some("1"));
+        assert_eq!(arg_value(&macos_args, "-level"), Some("4.2"));
+        assert_eq!(arg_value(&macos_args, "-colorspace"), Some("bt709"));
+        assert_eq!(arg_value(&macos_args, "-color_primaries"), Some("bt709"));
+        assert_eq!(arg_value(&macos_args, "-color_trc"), Some("bt709"));
+        assert_eq!(arg_value(&macos_args, "-color_range"), Some("tv"));
+
+        let video_4k60 = VideoSettings {
+            preset: VideoPreset::Record4k60Experimental,
+            width: 3840,
+            height: 2160,
+            fps: 60,
+            bitrate_kbps: 50_000,
+        };
+        let mut experimental_args = Vec::new();
+        append_h264_encoding_args_for_platform(
+            &mut experimental_args,
+            &video_4k60,
+            FfmpegH264Platform::Macos,
+            false,
+        );
+        assert_eq!(arg_value(&experimental_args, "-level"), Some("5.2"));
+        // 4K stays speed-priority even record-only: quality-mode 4K warmup
+        // falls behind realtime (0.9.44 owner incident).
+        assert_eq!(arg_value(&experimental_args, "-prio_speed"), Some("1"));
+
+        // Media Foundation exposes no profile/level options — Windows arms
+        // still get the colorimetry tags but keep the encoder-default level.
+        let mut windows_args = Vec::new();
+        append_h264_encoding_args_for_platform(
+            &mut windows_args,
+            &video_1080p60,
+            FfmpegH264Platform::WindowsHardware,
+            false,
+        );
+        assert_eq!(arg_value(&windows_args, "-profile:v"), None);
+        assert_eq!(arg_value(&windows_args, "-level"), None);
+        assert_eq!(arg_value(&windows_args, "-colorspace"), Some("bt709"));
+        assert_eq!(arg_value(&windows_args, "-color_range"), Some("tv"));
+    }
+
+    #[test]
     fn h264_encoder_args_are_platform_specific() {
         let video = VideoSettings {
             preset: VideoPreset::Custom,
@@ -10628,7 +11258,12 @@ mod tests {
         };
 
         let mut macos_args = Vec::new();
-        append_h264_encoding_args_for_platform(&mut macos_args, &video, FfmpegH264Platform::Macos);
+        append_h264_encoding_args_for_platform(
+            &mut macos_args,
+            &video,
+            FfmpegH264Platform::Macos,
+            true,
+        );
         assert_eq!(arg_value(&macos_args, "-c:v"), Some("h264_videotoolbox"));
         assert_eq!(arg_value(&macos_args, "-pix_fmt"), Some("yuv420p"));
         assert_eq!(arg_value(&macos_args, "-allow_sw"), Some("1"));
@@ -10640,6 +11275,7 @@ mod tests {
             &mut windows_args,
             &video,
             FfmpegH264Platform::WindowsHardware,
+            true,
         );
         assert_eq!(arg_value(&windows_args, "-c:v"), Some("h264_mf"));
         assert_eq!(arg_value(&windows_args, "-pix_fmt"), Some("nv12"));
@@ -10653,15 +11289,32 @@ mod tests {
             &mut windows_software_args,
             &video,
             FfmpegH264Platform::WindowsSoftware,
+            true,
         );
-        assert_eq!(arg_value(&windows_software_args, "-c:v"), Some("h264_mf"));
+        assert_eq!(
+            arg_value(&windows_software_args, "-c:v"),
+            Some("libopenh264")
+        );
+        assert_eq!(
+            arg_value(&windows_software_args, "-pix_fmt"),
+            Some("yuv420p")
+        );
         assert_eq!(arg_value(&windows_software_args, "-hw_encoding"), None);
+        assert_eq!(
+            arg_value(&windows_software_args, "-rc_mode"),
+            Some("bitrate")
+        );
+        assert_eq!(
+            arg_value(&windows_software_args, "-allow_skip_frames"),
+            Some("1")
+        );
 
         let mut fallback_args = Vec::new();
         append_h264_encoding_args_for_platform(
             &mut fallback_args,
             &video,
             FfmpegH264Platform::Other,
+            true,
         );
         assert_eq!(arg_value(&fallback_args, "-c:v"), Some("libx264"));
         assert_eq!(arg_value(&fallback_args, "-pix_fmt"), Some("yuv420p"));
@@ -10698,7 +11351,7 @@ mod tests {
         );
         assert_eq!(
             ffmpeg_h264_encoder(FfmpegH264Platform::WindowsSoftware).backend,
-            EncodeBackend::SoftwareMediaFoundation
+            EncodeBackend::SoftwareOpenH264
         );
         assert_eq!(
             ffmpeg_h264_encoder(FfmpegH264Platform::Other).backend,
@@ -10726,6 +11379,39 @@ mod tests {
         );
         assert_eq!(arg_value(&args, "-frames:v"), Some("3"));
 
+        // Plan 035: the probe must exercise the REAL record+stream tee — the
+        // hardware encoder has passed null-output probes and then failed
+        // during tee header creation in production.
+        let output_format = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-f")
+            .map(|pair| pair[1].as_str())
+            .next_back();
+        assert_eq!(
+            output_format,
+            Some("tee"),
+            "probe output must be the tee muxer"
+        );
+        assert!(
+            !args.contains(&"null".to_string()),
+            "null-output probes prove nothing"
+        );
+        assert_eq!(arg_value(&args, "-use_fifo"), Some("1"));
+        assert_eq!(
+            arg_value(&args, "-fifo_options"),
+            Some("queue_size=512:drop_pkts_on_overflow=1"),
+            "probe tee must use the production fifo isolation"
+        );
+        let tee_spec = args.last().unwrap();
+        assert!(
+            tee_spec.contains("[f=matroska:onfail=abort]"),
+            "recording leg shape missing"
+        );
+        assert!(
+            tee_spec.contains("[f=flv:onfail=ignore:flvflags=no_duration_filesize]"),
+            "stream leg shape missing"
+        );
+
         let key = windows_media_foundation_probe_key("ffmpeg", &video);
         let mut higher_fps = video.clone();
         higher_fps.fps = 60;
@@ -10738,6 +11424,106 @@ mod tests {
             key,
             windows_media_foundation_probe_key("alternate-ffmpeg", &video),
             "hardware results must not leak across FFmpeg binaries"
+        );
+    }
+
+    #[test]
+    fn media_foundation_probe_key_tracks_the_ffmpeg_binary_bytes_not_only_its_path() {
+        // App updates replace the bundled ffmpeg IN PLACE: same path, new
+        // binary. The capability key must change with it or a stale hardware
+        // verdict outlives the encoder build that produced it.
+        let video = VideoSettings {
+            preset: VideoPreset::Custom,
+            width: 1920,
+            height: 1080,
+            fps: 30,
+            bitrate_kbps: 6_000,
+        };
+        let binary =
+            std::env::temp_dir().join(format!("videorc-mf-probe-key-{}.bin", Uuid::new_v4()));
+        std::fs::write(&binary, b"build-one").unwrap();
+        let first = windows_media_foundation_probe_key(binary.to_str().unwrap(), &video);
+        assert_eq!(
+            first,
+            windows_media_foundation_probe_key(binary.to_str().unwrap(), &video)
+        );
+        assert_eq!(first.ffmpeg_len, Some(9));
+
+        std::fs::write(&binary, b"build-two-with-longer-bytes").unwrap();
+        let second = windows_media_foundation_probe_key(binary.to_str().unwrap(), &video);
+        let _ = std::fs::remove_file(&binary);
+        assert_ne!(
+            first, second,
+            "an in-place FFmpeg replacement must invalidate the cached verdict"
+        );
+    }
+
+    #[test]
+    fn media_foundation_probe_cache_replays_verdicts_including_failures() {
+        let video = VideoSettings {
+            preset: VideoPreset::Custom,
+            width: 1234,
+            height: 770,
+            fps: 24,
+            bitrate_kbps: 4_321,
+        };
+        let key = windows_media_foundation_probe_key("cache-test-ffmpeg", &video);
+        assert_eq!(windows_media_foundation_cached_outcome(&key), None);
+
+        let rejected = WindowsMediaFoundationProbeOutcome {
+            accepted: false,
+            reason: Some(
+                "tee-backed hardware probe failed (exit code 1): header error".to_string(),
+            ),
+        };
+        windows_media_foundation_store_outcome(key.clone(), rejected.clone());
+        // A cached failure must replay without re-running FFmpeg, keeping its
+        // exact fallback reason for every later session's diagnostics.
+        assert_eq!(
+            windows_media_foundation_cached_outcome(&key),
+            Some(rejected)
+        );
+
+        // A different profile is a different capability; it must not inherit
+        // the verdict.
+        let mut wider = video.clone();
+        wider.width = 3840;
+        wider.height = 2160;
+        let wider_key = windows_media_foundation_probe_key("cache-test-ffmpeg", &wider);
+        assert_eq!(windows_media_foundation_cached_outcome(&wider_key), None);
+    }
+
+    #[test]
+    fn media_foundation_fallback_reason_is_exact_and_bounded() {
+        assert_eq!(
+            windows_media_foundation_fallback_reason(None, "", true),
+            "tee-backed hardware probe timed out"
+        );
+        assert_eq!(
+            windows_media_foundation_fallback_reason(Some(1), "", false),
+            "tee-backed hardware probe failed (exit code 1)"
+        );
+        assert_eq!(
+            windows_media_foundation_fallback_reason(None, "killed", false),
+            "tee-backed hardware probe failed (terminated by signal): killed"
+        );
+        let reason = windows_media_foundation_fallback_reason(
+            Some(1),
+            "line one\nCould not create tee output header\u{7}",
+            false,
+        );
+        assert_eq!(
+            reason,
+            "tee-backed hardware probe failed (exit code 1): line one Could not create tee output header"
+        );
+        let long = "x".repeat(2000) + " Error creating output header";
+        let bounded = windows_media_foundation_fallback_reason(Some(187), &long, false);
+        assert!(bounded.len() < 500, "reason must stay one loggable line");
+        assert!(bounded.contains("exit code 187"));
+        assert!(bounded.ends_with("Error creating output header"));
+        assert!(
+            bounded.contains('…'),
+            "a trimmed tail must be visibly truncated"
         );
     }
 
@@ -10829,6 +11615,38 @@ mod tests {
         assert!(committed.scene_revision > 1_000);
     }
 
+    #[test]
+    fn record_only_60fps_rides_the_bridge_up_to_1440p() {
+        let mut params = base_params(true, false);
+        params.output.video = VideoSettings {
+            preset: VideoPreset::Custom,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps: 12_000,
+        };
+        assert!(record_only_bridge_60fps_eligible(&params));
+
+        params.output.video.width = 2560;
+        params.output.video.height = 1440;
+        assert!(record_only_bridge_60fps_eligible(&params));
+
+        // Vertical twin of 1440p60 is inside the envelope too.
+        params.output.video.width = 1440;
+        params.output.video.height = 2560;
+        assert!(record_only_bridge_60fps_eligible(&params));
+
+        // 4K60 keeps the legacy path until it has its own perf evidence.
+        params.output.video.width = 3840;
+        params.output.video.height = 2160;
+        assert!(!record_only_bridge_60fps_eligible(&params));
+
+        // Streaming above 30fps keeps the legacy path.
+        let mut streaming = base_params(true, true);
+        streaming.output.video.fps = 60;
+        assert!(!record_only_bridge_60fps_eligible(&streaming));
+    }
+
     fn base_params(record_enabled: bool, stream_enabled: bool) -> StartSessionParams {
         StartSessionParams {
             captions: None,
@@ -10864,6 +11682,7 @@ mod tests {
             },
             scene: None,
             output: OutputSettings {
+                keep_original_mkv: false,
                 record_enabled,
                 stream_enabled,
                 output_directory: None,
@@ -12636,7 +13455,7 @@ mod tests {
         args[start..input_position].iter().any(|arg| arg == name)
     }
 
-    fn assert_current_h264_encoder_args(args: &[String]) {
+    fn assert_current_h264_encoder_args(args: &[String], low_latency: bool) {
         let platform = current_ffmpeg_h264_platform();
         let encoder = ffmpeg_h264_encoder(platform);
         assert_eq!(arg_value(args, "-c:v"), Some(encoder.codec));
@@ -12644,7 +13463,12 @@ mod tests {
             FfmpegH264Platform::Macos => {
                 assert_eq!(arg_value(args, "-allow_sw"), Some("1"));
                 assert_eq!(arg_value(args, "-realtime"), Some("1"));
-                assert_eq!(arg_value(args, "-prio_speed"), Some("1"));
+                // Speed-over-quality rides only with live legs; record-only
+                // encodes for quality.
+                assert_eq!(
+                    arg_value(args, "-prio_speed"),
+                    if low_latency { Some("1") } else { None }
+                );
             }
             FfmpegH264Platform::WindowsHardware => {
                 assert_eq!(arg_value(args, "-allow_sw"), None);
@@ -12658,7 +13482,7 @@ mod tests {
                 assert_eq!(arg_value(args, "-realtime"), None);
                 assert_eq!(arg_value(args, "-prio_speed"), None);
                 assert_eq!(arg_value(args, "-hw_encoding"), None);
-                assert_eq!(encoder.backend, EncodeBackend::SoftwareMediaFoundation);
+                assert_eq!(encoder.backend, EncodeBackend::SoftwareOpenH264);
             }
             FfmpegH264Platform::Other => {
                 assert_eq!(arg_value(args, "-allow_sw"), None);
@@ -12735,7 +13559,7 @@ mod tests {
         );
         assert!(!args.iter().any(|arg| arg == "[preview]"));
         assert!(args.iter().any(|arg| arg == "1:a?"));
-        assert_current_h264_encoder_args(&args);
+        assert_current_h264_encoder_args(&args, false);
         assert_eq!(arg_value(&args, "-c:a"), Some("pcm_s16le"));
         assert!(args.iter().any(|arg| arg == "-shortest"));
 
@@ -13628,10 +14452,11 @@ mod tests {
         assert!(clamped.contains("2500.000"), "{clamped}");
     }
 
-    // Chroma key (2026-07-13 plan): the FFmpeg leg maps the ONE keyer spec to
-    // chromakey/despill — similarity and blend are the spec's threshold/band
-    // normalized to the CbCr diagonal (255·√2). Pin the string so the mapping
-    // cannot silently drift from the CPU/Metal keyers.
+    // Chroma key (real-screen fix, 2026-07-14): the FFmpeg leg approximates
+    // the angle keyer with chromakey anchored at an EFFECTIVE key color — the
+    // spec's chroma direction at realistic screen saturation (NOT the pure
+    // preset color, whose saturation put real screens outside any usable
+    // radius — the 0.9.39 bug). Pin the mapping so it cannot drift.
     #[test]
     fn camera_chroma_key_filter_pins_the_chromakey_despill_mapping() {
         let mut layout = crate::protocol::default_layout_settings();
@@ -13640,7 +14465,7 @@ mod tests {
         layout.camera_chroma_key_enabled = true;
         assert_eq!(
             camera_chroma_key_filter(&layout),
-            "chromakey=color=0x00FF00:similarity=0.1997:blend=0.0399,despill=type=green:mix=0.1000,"
+            "chromakey=color=0x44AB43:similarity=0.1175:blend=0.0128,despill=type=green:mix=0.1000,"
         );
 
         layout.camera_chroma_key_color = "#0000FF".to_string();
@@ -13648,17 +14473,69 @@ mod tests {
         layout.camera_chroma_key_spill_pct = 0;
         assert_eq!(
             camera_chroma_key_filter(&layout),
-            "chromakey=color=0x0000FF:similarity=0.1997:blend=0.0000,",
+            "chromakey=color=0x7474E0:similarity=0.1175:blend=0.0000,",
             "zero band is a hard cut and zero spill drops despill"
         );
 
-        // A zero similarity floors at chromakey's minimum instead of erroring.
+        // Zero similarity keeps the base saturation-spread radius (a real
+        // screen still keys) instead of collapsing to an exact-color match.
         layout.camera_chroma_key_similarity_pct = 0;
         assert!(
-            camera_chroma_key_filter(&layout).contains("similarity=0.0001"),
+            camera_chroma_key_filter(&layout).contains("similarity=0.0555"),
             "{}",
             camera_chroma_key_filter(&layout)
         );
+    }
+
+    /// The FFmpeg-leg twin of scene_geometry's realistic-palette pin: under
+    /// chromakey's absolute-CbCr-distance model, the DEFAULT mapping must key
+    /// every real screen tone and keep the subject. (Pure synthetic green
+    /// falls outside the effective disc — real footage is the contract.)
+    #[test]
+    fn ffmpeg_chroma_mapping_keys_the_realistic_palette() {
+        let mut layout = crate::protocol::default_layout_settings();
+        layout.camera_chroma_key_enabled = true;
+        let spec = camera_chroma_key(&layout).expect("keying enabled");
+        let (effective_rgb, similarity_units) =
+            ffmpeg_chroma_key_mapping(&spec).expect("green key has a direction");
+        // Same coefficient family as color.rs / scene_geometry, local to the
+        // test because the spec helpers work on the key color only.
+        let cbcr = |rgb: [u8; 3]| {
+            let [r, g, b] = rgb.map(f64::from);
+            (
+                128.0 + (-43.0 * r - 85.0 * g + 128.0 * b) / 256.0,
+                128.0 + (128.0 * r - 107.0 * g - 21.0 * b) / 256.0,
+            )
+        };
+        let (key_cb, key_cr) = cbcr(effective_rgb);
+        let distance = |rgb: [u8; 3]| {
+            let (cb, cr) = cbcr(rgb);
+            ((cb - key_cb).powi(2) + (cr - key_cr).powi(2)).sqrt()
+        };
+        for (label, rgb) in [
+            ("bright lit screen", [80u8, 200, 90]),
+            ("well-lit screen", [60, 180, 70]),
+            ("mid screen", [40, 140, 55]),
+            ("shadowed screen", [30, 100, 40]),
+            ("overexposed edge", [110, 190, 120]),
+        ] {
+            assert!(
+                distance(rgb) <= similarity_units,
+                "{label} must be inside the chromakey disc ({:.1} > {similarity_units:.1})",
+                distance(rgb)
+            );
+        }
+        for (label, rgb) in [
+            ("skin", [200u8, 160, 140]),
+            ("dark hair", [40, 30, 25]),
+            ("white shirt", [230, 230, 230]),
+        ] {
+            assert!(
+                distance(rgb) > similarity_units + 10.0,
+                "{label} must stay clearly outside the disc ({:.1})",
+                distance(rgb)
+            );
+        }
     }
 
     #[test]
@@ -13793,6 +14670,36 @@ mod tests {
         // No frames and no callback cadence at all is not ready.
         assert!(!camera_cadence_ready(None, None, Some(40), threshold));
         assert!(!camera_cadence_ready(None, Some(76.9), None, threshold));
+    }
+
+    #[test]
+    fn camera_cadence_mismatch_warns_on_wrong_delivery_rate() {
+        // The 2026-07 incident shape: Cam Link 4K relaying a 24p mirrorless into a
+        // 30fps session. ~23.98 measured vs 30 target -> warn with the repeat count.
+        let warning = camera_cadence_mismatch_warning(Some(23.976), 30)
+            .expect("24p into a 30fps session must warn");
+        assert!(warning.contains("23.98 fps"), "{warning}");
+        assert!(warning.contains("~6 repeated"), "{warning}");
+        assert!(warning.contains("30p"), "{warning}");
+
+        // A camera faster than the session drops frames instead.
+        let warning = camera_cadence_mismatch_warning(Some(59.94), 30)
+            .expect("60p into a 30fps session must warn");
+        assert!(warning.contains("dropped"), "{warning}");
+    }
+
+    #[test]
+    fn camera_cadence_mismatch_accepts_matching_and_ntsc_rates() {
+        // Exact and NTSC-offset rates are within the 2% tolerance.
+        assert!(camera_cadence_mismatch_warning(Some(30.0), 30).is_none());
+        assert!(camera_cadence_mismatch_warning(Some(29.97), 30).is_none());
+        assert!(camera_cadence_mismatch_warning(Some(59.94), 60).is_none());
+        // Measurement decay within tolerance stays quiet.
+        assert!(camera_cadence_mismatch_warning(Some(29.5), 30).is_none());
+        // Missing or garbage measurements never warn.
+        assert!(camera_cadence_mismatch_warning(None, 30).is_none());
+        assert!(camera_cadence_mismatch_warning(Some(0.0), 30).is_none());
+        assert!(camera_cadence_mismatch_warning(Some(f64::NAN), 30).is_none());
     }
 
     #[test]
@@ -14033,6 +14940,16 @@ mod tests {
             parse_ffmpeg_filter_command_reply("Command reply for stream 0: ret:-78 res:"),
             Some(FfmpegFilterCommandReply { return_code: -78 })
         );
+        assert_eq!(
+            parse_ffmpeg_filter_command_reply("ly for stream -1: ret:0 res:"),
+            Some(FfmpegFilterCommandReply { return_code: 0 })
+        );
+        assert_eq!(
+            parse_ffmpeg_filter_command_reply(
+                "frame=120 fps=30\rCommand reply for stream -1: ret:0 res:"
+            ),
+            Some(FfmpegFilterCommandReply { return_code: 0 })
+        );
         assert_eq!(parse_ffmpeg_filter_command_reply("ret:0 res:"), None);
         assert_eq!(
             parse_ffmpeg_filter_command_reply("Command reply for stream 0: ret:nope res:"),
@@ -14183,6 +15100,43 @@ mod tests {
         assert_eq!(written, expected);
         assert!(control.healthy);
         assert_eq!(control.last_applied.gain_db, 6.0);
+    }
+
+    #[tokio::test]
+    async fn ffmpeg_live_audio_control_ignores_unrelated_filter_graph_rejections() {
+        let (sender, replies) = mpsc::unbounded_channel();
+        let mut control =
+            FfmpegLiveAudioControl::new(1, replies, AudioProcessingSettings::default());
+        let (mut stdin, ffmpeg_stdin) = tokio::io::duplex(1024);
+        let acknowledgements = tokio::spawn(async move {
+            let mut commands = BufReader::new(ffmpeg_stdin).lines();
+            for _ in 0..2 {
+                commands.next_line().await.unwrap().unwrap();
+                sender
+                    .send(FfmpegFilterCommandReply { return_code: -40 })
+                    .unwrap();
+                sender
+                    .send(FfmpegFilterCommandReply { return_code: 0 })
+                    .unwrap();
+            }
+        });
+
+        for gain_db in [6.0, -6.0] {
+            control
+                .apply(
+                    &mut stdin,
+                    AudioProcessingSettings {
+                        gain_db,
+                        muted: false,
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        acknowledgements.await.unwrap();
+
+        assert!(control.healthy);
+        assert_eq!(control.last_applied.gain_db, -6.0);
     }
 
     #[tokio::test]
@@ -14572,6 +15526,7 @@ mod tests {
             encoder_bridge: None,
             encoder_bridge_stream: None,
             captioned_copy_requested: false,
+            keep_original_media: false,
             comment_highlight_available: false,
             _capture_permit: None,
             stop_intent_sender: Some(stop_intent_sender),
@@ -14998,7 +15953,7 @@ mod tests {
         assert_eq!(arg_value(&args, "-ac"), Some("2"));
         assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
         assert_eq!(arg_value(&args, "-b:a"), Some("160k"));
-        assert_current_h264_encoder_args(&args);
+        assert_current_h264_encoder_args(&args, true);
         // A pinned 2-second keyframe interval so YouTube (and HLS/DVR) go live.
         assert_eq!(
             arg_value(&args, "-force_key_frames"),
@@ -15068,7 +16023,9 @@ mod tests {
         assert!(!args.iter().any(|arg| arg == "3:a?"));
         let filter = arg_value(&args, "-filter_complex").unwrap();
         assert!(filter.contains("[v][3:v]overlay=x=0:y=0"));
-        assert!(filter.contains("[v_screen]split=2[v_main][v_preview]"));
+        assert!(filter.contains(
+            "[v_screen]split=2[v_main_rgb][v_preview];[v_main_rgb]scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,format=yuv420p[v_main]"
+        ));
     }
 
     #[test]
@@ -15106,7 +16063,9 @@ mod tests {
         assert!(filter.contains("scene_canvas0"));
         assert!(filter.contains("[0:v]setpts=PTS-STARTPTS"));
         assert!(!filter.contains("[1:v]setpts=PTS-STARTPTS"));
-        assert!(filter.contains("[v]split=2[v_main][v_preview]"));
+        assert!(filter.contains(
+            "[v]split=2[v_main_rgb][v_preview];[v_main_rgb]scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,format=yuv420p[v_main]"
+        ));
     }
 
     #[test]
@@ -15327,7 +16286,9 @@ mod tests {
         let second_overlay = filter.find("[scene_canvas1][scene_layer1]").unwrap();
         assert!(camera_layer < screen_layer, "{filter}");
         assert!(first_overlay < second_overlay, "{filter}");
-        assert!(filter.contains("[v]split=2[v_main][v_preview]"));
+        assert!(filter.contains(
+            "[v]split=2[v_main_rgb][v_preview];[v_main_rgb]scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,format=yuv420p[v_main]"
+        ));
     }
 
     #[test]
@@ -15378,7 +16339,9 @@ mod tests {
         assert!(filter.contains("[0:v]setpts=PTS-STARTPTS"));
         assert!(filter.contains("[1:v]setpts=PTS-STARTPTS"));
         assert!(filter.contains("[v][2:v]overlay=x=0:y=0"));
-        assert!(filter.contains("[v_screen]split=2[v_main][v_preview]"));
+        assert!(filter.contains(
+            "[v_screen]split=2[v_main_rgb][v_preview];[v_main_rgb]scale=out_color_matrix=bt709:out_range=tv,setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709:range=tv,format=yuv420p[v_main]"
+        ));
     }
 
     #[test]
@@ -15697,17 +16660,38 @@ mod tests {
     }
 
     #[test]
+    fn mkv_duration_tag_parses_hms_nanoseconds() {
+        assert_eq!(parse_mkv_duration_tag("00:00:06.336000000"), Some(6.336));
+        assert_eq!(parse_mkv_duration_tag("01:02:03.500000000"), Some(3723.5));
+        assert_eq!(parse_mkv_duration_tag("garbage"), None);
+    }
+
+    #[test]
     fn mp4_export_copies_video_and_encodes_audio_for_mp4_compatibility() {
         let args = mp4_export_args(
             Path::new("/tmp/videorc-test.mkv"),
             Path::new("/tmp/videorc-test.mp4"),
+            None,
+        );
+        assert!(!args.iter().any(|arg| arg == "-t"));
+
+        // A divergent stop tail trims the export to the shorter stream.
+        let trimmed = mp4_export_args(
+            Path::new("/tmp/videorc-test.mkv"),
+            Path::new("/tmp/videorc-test.mp4"),
+            Some(6.336),
+        );
+        assert_eq!(arg_value(&trimmed, "-t"), Some("6.336"));
+        assert_eq!(
+            trimmed.last().map(String::as_str),
+            Some("/tmp/videorc-test.mp4")
         );
 
         assert_eq!(arg_value(&args, "-i"), Some("/tmp/videorc-test.mkv"));
         assert_eq!(arg_value(&args, "-map"), Some("0"));
         assert_eq!(arg_value(&args, "-c:v"), Some("copy"));
         assert_eq!(arg_value(&args, "-c:a"), Some("aac"));
-        assert_eq!(arg_value(&args, "-b:a"), Some("160k"));
+        assert_eq!(arg_value(&args, "-b:a"), Some("256k"));
         assert_eq!(arg_value(&args, "-movflags"), Some("+faststart"));
         assert!(args.iter().any(|arg| arg == "-n"));
         assert!(!args.iter().any(|arg| arg == "-y"));
@@ -15727,7 +16711,7 @@ mod tests {
         let preferred = directory.join("recording.mp4");
 
         let staging = prepare_mp4_export_staging(&preferred).unwrap();
-        let args = mp4_export_args(&directory.join("recording.mkv"), &staging.output_path);
+        let args = mp4_export_args(&directory.join("recording.mkv"), &staging.output_path, None);
 
         assert!(staging.directory_path.is_dir());
         assert!(!staging.output_path.exists());
@@ -17428,10 +18412,36 @@ mod tests {
         assert!(error.contains("must be 3840x2160@30"), "{error}");
     }
 
+    #[test]
+    fn ffmpeg_file_path_unwraps_windows_verbatim_paths() {
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(
+                ffmpeg_file_path(std::path::Path::new(r"\\?\C:\recordings\capture.mkv")),
+                r"C:\recordings\capture.mkv"
+            );
+            assert_eq!(
+                ffmpeg_file_path(std::path::Path::new(r"\\?\UNC\server\share\capture.mkv")),
+                r"\\server\share\capture.mkv"
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            ffmpeg_file_path(std::path::Path::new("/tmp/capture.mkv")),
+            "/tmp/capture.mkv"
+        );
+    }
     #[tokio::test]
     async fn preview_command_times_out() {
-        let args = vec!["-c".to_string(), "sleep 5".to_string()];
-        let error = run_preview_command_with_timeout("sh", &args, Duration::from_millis(100))
+        #[cfg(target_os = "windows")]
+        let (command, args) = (
+            "ping",
+            vec!["-n".to_string(), "6".to_string(), "127.0.0.1".to_string()],
+        );
+        #[cfg(not(target_os = "windows"))]
+        let (command, args) = ("sh", vec!["-c".to_string(), "sleep 5".to_string()]);
+
+        let error = run_preview_command_with_timeout(command, &args, Duration::from_millis(100))
             .await
             .unwrap_err();
 

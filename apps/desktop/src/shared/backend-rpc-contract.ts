@@ -2,6 +2,7 @@ import type {
   AdminConnection,
   AdminConnectionTestResult,
   AdminEvent,
+  AdminIdentity,
   AdminMember,
   AdminMemberInput,
   AdminRegisterResult,
@@ -34,6 +35,7 @@ import type {
   LivingTextAvailableTranslation,
   LivingTextBook,
   LivingTextResolvedCitation,
+  LivingTextSearchHit,
   LivingTextSyncSummary,
   LivingTextTranslation,
   LivingTextVerse,
@@ -41,6 +43,9 @@ import type {
   ManualCheckInInput,
   MembersPage,
   MembersQuery,
+  NdiConfig,
+  NdiFrameAck,
+  NdiStatus,
   NoiseCleanupJob,
   NotificationCampaign,
   OAuthCallbackResult,
@@ -61,12 +66,16 @@ import type {
   ServerResponse,
   SessionCommentsListParams,
   SessionCommentsPage,
+  SessionAiArtifactsPage,
   SessionDeletionOperation,
+  SessionDetailListParams,
+  SessionHealthEventsPage,
+  SessionListPage,
+  SessionListParams,
+  SessionLogsPage,
   SessionStorageTotals,
-  SessionSummary,
   StartSessionParams,
   TeamUser,
-  UnitMemberSummary,
   UpdateCampaignInput,
   UpdateEventInput,
   UpdateLocationInput,
@@ -145,7 +154,13 @@ export interface BackendRpcMethodMap {
   'preview.camera.status': BackendRpcDefinition<undefined, PreviewCameraStatus>
   'preview.screen.status': BackendRpcDefinition<undefined, PreviewScreenStatus>
   'diagnostics.stats': BackendRpcDefinition<undefined, DiagnosticStats>
-  'sessions.list': BackendRpcDefinition<{ limit?: number } | undefined, SessionSummary[]>
+  'sessions.list': BackendRpcDefinition<SessionListParams, SessionListPage>
+  'sessions.healthEvents.list': BackendRpcDefinition<
+    SessionDetailListParams,
+    SessionHealthEventsPage
+  >
+  'sessions.logs.list': BackendRpcDefinition<SessionDetailListParams, SessionLogsPage>
+  'sessions.aiArtifacts.list': BackendRpcDefinition<SessionDetailListParams, SessionAiArtifactsPage>
   'sessions.storage': BackendRpcDefinition<undefined, SessionStorageTotals>
   'sessions.comments.list': BackendRpcDefinition<SessionCommentsListParams, SessionCommentsPage>
   'sessions.delete': BackendRpcDefinition<{ sessionIds: string[] }, SessionDeletionOperation[]>
@@ -179,8 +194,17 @@ export interface BackendRpcMethodMap {
     },
     AdminRegisterResult
   >
+  'admin.auth.login': BackendRpcDefinition<
+    { baseUrl?: string; email: string; password: string; organization?: string },
+    AdminIdentity
+  >
+  'admin.auth.get': BackendRpcDefinition<undefined, AdminIdentity | null>
+  'admin.auth.logout': BackendRpcDefinition<undefined, { loggedOut: boolean }>
   'livingText.books.list': BackendRpcDefinition<undefined, LivingTextBook[]>
-  'livingText.availableTranslations.list': BackendRpcDefinition<undefined, LivingTextAvailableTranslation[]>
+  'livingText.availableTranslations.list': BackendRpcDefinition<
+    undefined,
+    LivingTextAvailableTranslation[]
+  >
   'livingText.translations.list': BackendRpcDefinition<undefined, LivingTextTranslation[]>
   'livingText.sync': BackendRpcDefinition<{ translationCode: string }, LivingTextSyncSummary>
   'livingText.chapter.get': BackendRpcDefinition<
@@ -190,6 +214,21 @@ export interface BackendRpcMethodMap {
   'livingText.detect': BackendRpcDefinition<
     { translationCode: string; text: string },
     LivingTextResolvedCitation[]
+  >
+  'livingText.search': BackendRpcDefinition<
+    { translationCode: string; query: string; book?: string; limit?: number },
+    LivingTextSearchHit[]
+  >
+  'livingText.crossRef': BackendRpcDefinition<
+    { translationCode: string; referenceText: string },
+    LivingTextVerse[]
+  >
+  'ndi.start': BackendRpcDefinition<NdiConfig, NdiStatus>
+  'ndi.stop': BackendRpcDefinition<undefined, NdiStatus>
+  'ndi.status': BackendRpcDefinition<undefined, NdiStatus>
+  'ndi.frame': BackendRpcDefinition<
+    { width: number; height: number; rgbaBase64: string },
+    NdiFrameAck
   >
   'admin.sermons.list': BackendRpcDefinition<undefined, AdminSermon[]>
   'admin.sermons.create': BackendRpcDefinition<
@@ -239,14 +278,23 @@ export interface BackendRpcMethodMap {
   'admin.attendance.close': BackendRpcDefinition<{ eventId: string }, AttendanceSession>
   'admin.attendance.qr': BackendRpcDefinition<{ eventId: string }, AttendanceQr>
   'admin.attendance.list': BackendRpcDefinition<{ eventId: string }, AttendanceList>
-  'admin.attendance.manual': BackendRpcDefinition<{ eventId: string } & ManualCheckInInput, AttendanceRecord>
-  'admin.attendance.delete': BackendRpcDefinition<{ eventId: string; recordId: string }, { deleted: boolean }>
+  'admin.attendance.manual': BackendRpcDefinition<
+    { eventId: string } & ManualCheckInInput,
+    AttendanceRecord
+  >
+  'admin.attendance.delete': BackendRpcDefinition<
+    { eventId: string; recordId: string },
+    { deleted: boolean }
+  >
   'admin.units.list': BackendRpcDefinition<undefined, OrganizationalUnit[]>
   'admin.units.get': BackendRpcDefinition<{ id: string }, OrganizationalUnit>
   'admin.units.create': BackendRpcDefinition<CreateUnitInput, OrganizationalUnit>
   'admin.units.update': BackendRpcDefinition<{ id: string } & UpdateUnitInput, OrganizationalUnit>
   'admin.units.delete': BackendRpcDefinition<{ id: string }, { deleted: boolean }>
-  'admin.units.members.add': BackendRpcDefinition<{ unitId: string; memberId: string }, OrganizationalUnitMembership>
+  'admin.units.members.add': BackendRpcDefinition<
+    { unitId: string; memberId: string },
+    OrganizationalUnitMembership
+  >
   'admin.units.members.remove': BackendRpcDefinition<
     { unitId: string; membershipId: string },
     { deleted: boolean }
@@ -720,16 +768,121 @@ const sessionSummarySchema = boundedSemanticValue(
       id: boundedString,
       title: stringSchema({ maxLength: 16_384 }),
       startedAt: timestamp,
+      endedAt: optionalSchema(timestamp),
       status: boundedString,
       mode: boundedString,
+      outputPath: optionalSchema(boundedPath),
+      mp4Path: optionalSchema(boundedPath),
+      streamPreset: optionalSchema(stringSchema({ maxLength: 1024 })),
+      container: optionalSchema(enumSchema(['none', 'mkv', 'flv', 'tee'])),
+      durationMs: optionalSchema(nonNegativeInteger),
+      fileSizeBytes: optionalSchema(nonNegativeInteger),
+      sceneLabel: optionalSchema(stringSchema({ maxLength: 1024 })),
+      qualityStatus: optionalSchema(boundedBackendPayloadSchema),
+      healthEventCount: nonNegativeInteger,
+      sessionLogCount: nonNegativeInteger,
+      aiArtifactCount: nonNegativeInteger,
+      readyAiArtifactKinds: optionalSchema(
+        arraySchema(
+          enumSchema([
+            'audio-extract',
+            'transcript',
+            'title-description',
+            'summary',
+            'chapters',
+            'highlights',
+            'social-posts',
+            'smart-zoom',
+            'noise-cleanup',
+            'silence-removal',
+            'health-assistant'
+          ]),
+          { maxLength: 11 }
+        )
+      ),
       commentCount: nonNegativeInteger,
       derivedFromSessionId: optionalSchema(boundedString),
       sourceTitle: optionalSchema(stringSchema({ maxLength: 16_384 })),
       processingKind: optionalSchema(literalSchema('noise-cleanup'))
     },
-    { allowUnknown: true }
+    { allowUnknown: false }
   )
 )
+
+const sessionListParamsSchema = objectSchema(
+  {
+    cursor: optionalSchema(stringSchema({ minLength: 1, maxLength: 4096 })),
+    limit: optionalSchema(numberSchema({ integer: true, min: 1, max: 200 }))
+  },
+  { allowUnknown: false }
+)
+
+const sessionDetailListParamsSchema = objectSchema(
+  {
+    sessionId: boundedString,
+    cursor: optionalSchema(stringSchema({ minLength: 1, maxLength: 4096 })),
+    limit: optionalSchema(numberSchema({ integer: true, min: 1, max: 120 }))
+  },
+  { allowUnknown: false }
+)
+
+const healthEventSchema = objectSchema(
+  {
+    id: boundedString,
+    sessionId: nullableSchema(boundedString),
+    level: enumSchema(['info', 'warn', 'error']),
+    code: boundedString,
+    message: stringSchema({ maxLength: 16_384 }),
+    permissionPane: nullableSchema(
+      enumSchema(['privacy', 'screen-recording', 'camera', 'microphone'])
+    ),
+    createdAt: timestamp
+  },
+  { allowUnknown: false }
+)
+
+const sessionLogEntrySchema = objectSchema(
+  {
+    id: boundedString,
+    sessionId: boundedString,
+    level: enumSchema(['info', 'warn', 'error']),
+    code: boundedString,
+    message: stringSchema({ maxLength: 16_384 }),
+    sourceId: nullableSchema(stringSchema({ maxLength: 16_384 })),
+    permissionPane: nullableSchema(
+      enumSchema(['privacy', 'screen-recording', 'camera', 'microphone'])
+    ),
+    createdAt: timestamp
+  },
+  { allowUnknown: false }
+)
+
+const aiArtifactSchema = objectSchema(
+  {
+    id: boundedString,
+    sessionId: boundedString,
+    kind: enumSchema([
+      'audio-extract',
+      'transcript',
+      'title-description',
+      'summary',
+      'chapters',
+      'highlights',
+      'social-posts',
+      'smart-zoom',
+      'noise-cleanup',
+      'silence-removal',
+      'health-assistant'
+    ]),
+    status: enumSchema(['ready', 'pending-consent', 'failed']),
+    content: boundedBackendPayloadSchema,
+    filePath: nullableSchema(boundedPath),
+    createdAt: timestamp
+  },
+  { allowUnknown: false }
+)
+
+const nextCursorSchema = optionalSchema(stringSchema({ minLength: 1, maxLength: 4096 }))
 
 const sessionDeletionOperationSchema: RuntimeSchema<SessionDeletionOperation> = objectSchema(
   {
@@ -812,6 +965,7 @@ const sessionStartParamsSchema = objectSchema(
         recordEnabled: booleanSchema,
         streamEnabled: booleanSchema,
         outputDirectoryCapability: optionalSchema(boundedString),
+        keepOriginalMkv: optionalSchema(booleanSchema),
         video: boundedBackendParamValueSchema,
         rtmp: boundedBackendParamValueSchema
       },
@@ -907,6 +1061,28 @@ const adminRegisterResultSchema = objectSchema(
   },
   { allowUnknown: false }
 )
+const adminIdentitySchema = objectSchema(
+  {
+    user: objectSchema(
+      {
+        id: boundedString,
+        name: boundedString,
+        email: boundedString,
+        role: boundedString
+      },
+      { allowUnknown: false }
+    ),
+    organization: objectSchema(
+      {
+        id: boundedString,
+        name: boundedString,
+        slug: boundedString
+      },
+      { allowUnknown: false }
+    )
+  },
+  { allowUnknown: false }
+)
 // Rust's AdminSermon/SermonSeries serialize every Option<T> as an explicit
 // JSON `null` (no skip_serializing_if on these result types), matching the
 // admin API's own JSON. Nullable, not optional/undefined.
@@ -945,6 +1121,18 @@ const livingTextVerseSchema = objectSchema(
   },
   { allowUnknown: false }
 )
+const ndiStatusSchema = objectSchema(
+  {
+    active: booleanSchema,
+    sourceName: nullableSchema(stringSchema({ maxLength: 128 })),
+    width: numberSchema({ integer: true, min: 0, max: 4096 }),
+    height: numberSchema({ integer: true, min: 0, max: 4096 }),
+    fps: numberSchema({ integer: true, min: 0, max: 120 }),
+    frameCount: numberSchema({ integer: true, min: 0 }),
+    unavailableReason: nullableSchema(stringSchema({ maxLength: 2048 }))
+  },
+  { allowUnknown: false }
+)
 // Rust's DetectedCitation/ResolvedCitation serialize every Option<T> as an
 // explicit JSON `null` — same convention as AdminSermon above.
 const livingTextCitationFields = {
@@ -954,6 +1142,7 @@ const livingTextCitationFields = {
   verseStart: nullableSchema(numberSchema({ integer: true, min: 1, max: 999 })),
   verseEnd: nullableSchema(numberSchema({ integer: true, min: 1, max: 999 })),
   matchType: enumSchema(['explicit', 'chapter']),
+  confidence: numberSchema({ min: 0, max: 1 }),
   sourceText: stringSchema({ minLength: 1, maxLength: 512 }),
   index: numberSchema({ integer: true, min: 0 })
 }
@@ -962,6 +1151,16 @@ const livingTextResolvedCitationSchema = objectSchema(
     ...livingTextCitationFields,
     resolved: booleanSchema,
     verses: arraySchema(livingTextVerseSchema, { maxLength: 200 })
+  },
+  { allowUnknown: false }
+)
+const livingTextSearchHitSchema = objectSchema(
+  {
+    book: stringSchema({ minLength: 1, maxLength: 64 }),
+    bookNumber: numberSchema({ integer: true, min: 1, max: 66 }),
+    chapter: numberSchema({ integer: true, min: 1, max: 150 }),
+    verse: numberSchema({ integer: true, min: 1, max: 999 }),
+    snippet: stringSchema({ minLength: 1, maxLength: 4096 })
   },
   { allowUnknown: false }
 )
@@ -1335,9 +1534,16 @@ const organizationalUnitSchema = objectSchema(
     status: stringSchema({ minLength: 1, maxLength: 32 }),
     createdAt: timestamp,
     updatedAt: timestamp,
-    _count: optionalSchema(objectSchema({ memberships: numberSchema({ integer: true, min: 0 }) }, { allowUnknown: false })),
+    _count: optionalSchema(
+      objectSchema(
+        { memberships: numberSchema({ integer: true, min: 0 }) },
+        { allowUnknown: false }
+      )
+    ),
     positions: optionalSchema(arraySchema(organizationalUnitPositionSchema, { maxLength: 1_000 })),
-    memberships: optionalSchema(arraySchema(organizationalUnitMembershipSchema, { maxLength: 10_000 })),
+    memberships: optionalSchema(
+      arraySchema(organizationalUnitMembershipSchema, { maxLength: 10_000 })
+    ),
     childUnits: optionalSchema(arraySchema(unitBareSchema, { maxLength: 1_000 })),
     parentUnit: optionalSchema(nullableSchema(unitBareSchema))
   },
@@ -1386,7 +1592,10 @@ const locationSchema = objectSchema(
     updatedAt: timestamp,
     _count: optionalSchema(
       objectSchema(
-        { members: numberSchema({ integer: true, min: 0 }), events: numberSchema({ integer: true, min: 0 }) },
+        {
+          members: numberSchema({ integer: true, min: 0 }),
+          events: numberSchema({ integer: true, min: 0 })
+        },
         { allowUnknown: false }
       )
     )
@@ -1558,14 +1767,44 @@ const runtimeContracts = {
   'preview.screen.status': { params: undefinedSchema, result: previewScreenStatusSchema },
   'diagnostics.stats': { params: undefinedSchema, result: diagnosticStatsSchema },
   'sessions.list': {
-    params: unionSchema([
-      undefinedSchema,
-      objectSchema(
-        { limit: optionalSchema(numberSchema({ integer: true, min: 1, max: 1000 })) },
-        { allowUnknown: false }
-      )
-    ]),
-    result: arraySchema(sessionSummarySchema, { maxLength: 1000 })
+    params: sessionListParamsSchema,
+    result: objectSchema(
+      {
+        items: arraySchema(sessionSummarySchema, { maxLength: 200 }),
+        nextCursor: nextCursorSchema
+      },
+      { allowUnknown: false }
+    )
+  },
+  'sessions.healthEvents.list': {
+    params: sessionDetailListParamsSchema,
+    result: objectSchema(
+      {
+        events: arraySchema(healthEventSchema, { maxLength: 120 }),
+        nextCursor: nextCursorSchema
+      },
+      { allowUnknown: false }
+    )
+  },
+  'sessions.logs.list': {
+    params: sessionDetailListParamsSchema,
+    result: objectSchema(
+      {
+        entries: arraySchema(sessionLogEntrySchema, { maxLength: 120 }),
+        nextCursor: nextCursorSchema
+      },
+      { allowUnknown: false }
+    )
+  },
+  'sessions.aiArtifacts.list': {
+    params: sessionDetailListParamsSchema,
+    result: objectSchema(
+      {
+        artifacts: arraySchema(aiArtifactSchema, { maxLength: 120 }),
+        nextCursor: nextCursorSchema
+      },
+      { allowUnknown: false }
+    )
   },
   'sessions.storage': {
     params: undefinedSchema,
@@ -1673,6 +1912,26 @@ const runtimeContracts = {
     ),
     result: adminRegisterResultSchema
   },
+  'admin.auth.login': {
+    params: objectSchema(
+      {
+        baseUrl: optionalSchema(stringSchema({ minLength: 1, maxLength: 2048 })),
+        email: stringSchema({ minLength: 3, maxLength: 255 }),
+        password: stringSchema({ minLength: 1, maxLength: 512 }),
+        organization: optionalSchema(stringSchema({ minLength: 1, maxLength: 255 }))
+      },
+      { allowUnknown: false }
+    ),
+    result: adminIdentitySchema
+  },
+  'admin.auth.get': {
+    params: undefinedSchema,
+    result: nullableSchema(adminIdentitySchema)
+  },
+  'admin.auth.logout': {
+    params: undefinedSchema,
+    result: objectSchema({ loggedOut: booleanSchema }, { allowUnknown: false })
+  },
   'livingText.books.list': {
     params: undefinedSchema,
     result: arraySchema(livingTextBookSchema, { maxLength: 66 })
@@ -1719,6 +1978,57 @@ const runtimeContracts = {
       { allowUnknown: false }
     ),
     result: arraySchema(livingTextResolvedCitationSchema, { maxLength: 200 })
+  },
+  'livingText.search': {
+    params: objectSchema(
+      {
+        translationCode: stringSchema({ minLength: 1, maxLength: 20 }),
+        query: stringSchema({ minLength: 1, maxLength: 512 }),
+        book: optionalSchema(stringSchema({ minLength: 1, maxLength: 64 })),
+        limit: optionalSchema(numberSchema({ integer: true, min: 1, max: 500 }))
+      },
+      { allowUnknown: false }
+    ),
+    result: arraySchema(livingTextSearchHitSchema, { maxLength: 200 })
+  },
+  'livingText.crossRef': {
+    params: objectSchema(
+      {
+        translationCode: stringSchema({ minLength: 1, maxLength: 20 }),
+        referenceText: stringSchema({ minLength: 1, maxLength: 512 })
+      },
+      { allowUnknown: false }
+    ),
+    result: arraySchema(livingTextVerseSchema, { maxLength: 200 })
+  },
+  'ndi.start': {
+    params: objectSchema(
+      {
+        sourceName: stringSchema({ minLength: 1, maxLength: 128 }),
+        resolution: enumSchema(['r720p', 'r1080p', 'r4k']),
+        frameRate: enumSchema(['fps24', 'fps30', 'fps60']),
+        alphaMode: enumSchema(['noneOpaque', 'straightAlpha'])
+      },
+      { allowUnknown: false }
+    ),
+    result: ndiStatusSchema
+  },
+  'ndi.stop': { params: undefinedSchema, result: ndiStatusSchema },
+  'ndi.status': { params: undefinedSchema, result: ndiStatusSchema },
+  'ndi.frame': {
+    params: objectSchema(
+      {
+        width: numberSchema({ integer: true, min: 16, max: 4096 }),
+        height: numberSchema({ integer: true, min: 16, max: 4096 }),
+        // 4K RGBA is 33,177,600 bytes -> ~44.2M base64 chars.
+        rgbaBase64: stringSchema({ minLength: 4, maxLength: 45_000_000 })
+      },
+      { allowUnknown: false }
+    ),
+    result: objectSchema(
+      { frameCount: numberSchema({ integer: true, min: 0 }) },
+      { allowUnknown: false }
+    )
   },
   'admin.sermons.list': {
     params: undefinedSchema,
@@ -1974,11 +2284,17 @@ const runtimeContracts = {
     result: attendanceListSchema
   },
   'admin.attendance.manual': {
-    params: objectSchema({ eventId: boundedString, ...manualCheckInFields }, { allowUnknown: false }),
+    params: objectSchema(
+      { eventId: boundedString, ...manualCheckInFields },
+      { allowUnknown: false }
+    ),
     result: attendanceRecordSchema
   },
   'admin.attendance.delete': {
-    params: objectSchema({ eventId: boundedString, recordId: boundedString }, { allowUnknown: false }),
+    params: objectSchema(
+      { eventId: boundedString, recordId: boundedString },
+      { allowUnknown: false }
+    ),
     result: objectSchema({ deleted: booleanSchema }, { allowUnknown: false })
   },
   'admin.units.list': {
@@ -2009,20 +2325,33 @@ const runtimeContracts = {
     result: organizationalUnitMembershipSchema
   },
   'admin.units.members.remove': {
-    params: objectSchema({ unitId: boundedString, membershipId: boundedString }, { allowUnknown: false }),
+    params: objectSchema(
+      { unitId: boundedString, membershipId: boundedString },
+      { allowUnknown: false }
+    ),
     result: objectSchema({ deleted: booleanSchema }, { allowUnknown: false })
   },
   'admin.units.positions.create': {
-    params: objectSchema({ unitId: boundedString, ...createUnitPositionFields }, { allowUnknown: false }),
+    params: objectSchema(
+      { unitId: boundedString, ...createUnitPositionFields },
+      { allowUnknown: false }
+    ),
     result: organizationalUnitPositionSchema
   },
   'admin.units.positions.delete': {
-    params: objectSchema({ unitId: boundedString, positionId: boundedString }, { allowUnknown: false }),
+    params: objectSchema(
+      { unitId: boundedString, positionId: boundedString },
+      { allowUnknown: false }
+    ),
     result: objectSchema({ deleted: booleanSchema }, { allowUnknown: false })
   },
   'admin.units.positions.assign': {
     params: objectSchema(
-      { unitId: boundedString, positionId: boundedString, memberId: stringSchema({ minLength: 1, maxLength: 255 }) },
+      {
+        unitId: boundedString,
+        positionId: boundedString,
+        memberId: stringSchema({ minLength: 1, maxLength: 255 })
+      },
       { allowUnknown: false }
     ),
     result: organizationalUnitPositionAssignmentSchema
@@ -2074,10 +2403,7 @@ const runtimeContracts = {
     result: arraySchema(geocodeResultSchema, { maxLength: 50 })
   },
   'geocoding.reverse': {
-    params: objectSchema(
-      { lat: numberSchema(), lng: numberSchema() },
-      { allowUnknown: false }
-    ),
+    params: objectSchema({ lat: numberSchema(), lng: numberSchema() }, { allowUnknown: false }),
     result: geocodeReverseResultSchema
   }
 } satisfies Record<BackendRpcMethod, RuntimeBackendRpcContract>

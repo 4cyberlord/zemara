@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 
 import { performanceAppSpawnSpec, launchDevApp } from './lib/app-launcher.mjs'
+import { resolveFinalRecordingPath } from './lib/final-recording-path.mjs'
 import { analyzeRecording, writeReports } from './lib/recording-analyzer.mjs'
 import { requestSmokeCommand } from './lib/smoke-command-client.mjs'
 import { nativeWindowsScreenCandidates } from './lib/windows-native-screen-gates.mjs'
@@ -92,6 +93,8 @@ const launched = await launchDevApp({
 
 let ws
 const listeners = new Set()
+const recordingStatusEvents = []
+const healthEvents = []
 const report = {
   schemaVersion: 1,
   kind: 'windows-live-audio-controls',
@@ -107,7 +110,7 @@ try {
   const connection = launched.connections['backend-ready']
   const rendererSmoke = launched.connections['preview-motion-ready']
   ws = await connectBackend(connection, timeoutMs)
-  ws.addEventListener('message', captureDiagnosticSessionLog)
+  ws.addEventListener('message', captureBackendEvent)
   const health = await request(ws, timeoutMs, 'health.ping', { ffmpegPath })
   if (!health?.ffmpeg?.available) {
     throw new Error(health?.ffmpeg?.message ?? 'Bundled FFmpeg is unavailable.')
@@ -417,7 +420,18 @@ async function runScenario(ws, sources, scenario, index, rendererDriver) {
 
   const artifacts = []
   if (scenario.record) {
-    artifacts.push({ role: 'recording', path: stopped?.outputPath ?? started.outputPath })
+    const recordingPath = await resolveFinalRecordingPath({
+      started,
+      stopped,
+      recordingStatusEvents,
+      healthEvents,
+      stopRequestedAt,
+      timeoutMs
+    })
+    if (!recordingPath) {
+      throw new Error(`[${scenario.label}] no finalized recording artifact became available.`)
+    }
+    artifacts.push({ role: 'recording', path: recordingPath })
   }
   if (target) artifacts.push({ role: 'stream', path: target.recvPath })
   const mediaClock = await captureMediaClockForSession(sessionId)
@@ -660,20 +674,30 @@ async function runStopRace(ws, sources) {
     await updatePromise.catch(() => null)
     throw error
   }
-  const raceStartedAt = Date.now()
+  const stopRequestedAt = Date.now()
   const stopPromise = request(ws, timeoutMs, 'session.stop')
   const [update, stopped] = await withTimeout(
     Promise.all([updatePromise, stopPromise]),
     stopRaceTimeoutMs,
     `stop and in-flight microphone update did not settle within ${stopRaceTimeoutMs}ms`
   )
-  const elapsedMs = Date.now() - raceStartedAt
+  const elapsedMs = Date.now() - stopRequestedAt
   if (update?.applied !== false || update?.reasonCode !== 'session-ended') {
     throw new Error(
       `[stop-race] the dispatched in-flight update was not interrupted as session-ended: ${JSON.stringify(update)}`
     )
   }
-  const outputPath = stopped?.outputPath ?? started.outputPath
+  const outputPath = await resolveFinalRecordingPath({
+    started,
+    stopped,
+    recordingStatusEvents,
+    healthEvents,
+    stopRequestedAt,
+    timeoutMs
+  })
+  if (!outputPath) {
+    throw new Error('[stop-race] no finalized recording artifact became available.')
+  }
   assertArtifact(outputPath, 'stop-race', 'recording')
   const quality = await analyzeRecording(outputPath, {
     ffmpegPath,
@@ -784,9 +808,16 @@ function deviceSummary(device) {
   return { id: device.id, name: device.name, detail: device.detail ?? null }
 }
 
-function captureDiagnosticSessionLog(event) {
+function captureBackendEvent(event) {
   try {
     const message = JSON.parse(event.data)
+    const receivedAt = Date.now()
+    if (message?.event === 'recording.status') {
+      recordingStatusEvents.push({ ...message.payload, receivedAt })
+    }
+    if (message?.event === 'health.event') {
+      healthEvents.push({ ...message.payload, receivedAt })
+    }
     const entry = message?.event === 'session.log' ? message.payload : null
     if (!diagnosticSessionLogCodes.has(entry?.code)) return
     report.sessionLogs.push({
@@ -795,7 +826,7 @@ function captureDiagnosticSessionLog(event) {
       code: entry.code,
       message: entry.message,
       createdAt: entry.createdAt,
-      receivedAtMs: Date.now()
+      receivedAtMs: receivedAt
     })
   } catch {
     // Non-JSON websocket traffic is irrelevant to the evidence report.

@@ -11,7 +11,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Duration, MissedTickBehavior, sleep};
 use uuid::Uuid;
 
-use crate::color::rgb_to_yuv_full_range_bt601 as rgb_to_yuv;
+use crate::color::rgb_to_yuv_video_range_bt709 as rgb_to_yuv;
 use crate::compositor_synthetic::SyntheticMovingSource;
 use crate::diagnostics::{
     CompositorLiveSourceFetchStats, CompositorOutsideRenderTimingStats,
@@ -2166,19 +2166,21 @@ fn scene_mask_into_metal(mask: SceneMask) -> crate::metal_compositor::SourceMask
 }
 
 /// f32 projection of the shared keyer spec for the shader. The spec from
-/// `camera_chroma_key` stays the single source of truth.
+/// `camera_chroma_key` stays the single source of truth. A grey key color has
+/// no chroma direction — returns None so the quad renders unkeyed.
 #[cfg(target_os = "macos")]
 fn scene_chroma_key_into_metal(
     spec: &crate::scene_geometry::ChromaKeySpec,
-) -> crate::metal_compositor::GpuChromaKey {
-    crate::metal_compositor::GpuChromaKey {
-        key_cb: spec.key_cb() as f32,
-        key_cr: spec.key_cr() as f32,
-        threshold: spec.threshold as f32,
-        band: spec.band as f32,
+) -> Option<crate::metal_compositor::GpuChromaKey> {
+    let (dir_cb, dir_cr) = spec.key_direction()?;
+    Some(crate::metal_compositor::GpuChromaKey {
+        key_dir_cb: dir_cb as f32,
+        key_dir_cr: dir_cr as f32,
+        max_angle_rad: spec.max_angle_deg.to_radians() as f32,
+        band_rad: spec.band_deg.to_radians() as f32,
         spill: spec.spill as f32,
         spill_is_blue: spec.spill_is_blue(),
-    }
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -2626,10 +2628,13 @@ fn try_gpu_compose(
                         // The keyed camera is the one capture source that
                         // blends: its alpha comes from the shader's keyer,
                         // not the (untrustworthy) capture alpha channel.
-                        blend: camera_chroma_key(layout).is_some(),
+                        blend: camera_chroma_key(layout)
+                            .as_ref()
+                            .and_then(scene_chroma_key_into_metal)
+                            .is_some(),
                         chroma_key: camera_chroma_key(layout)
                             .as_ref()
-                            .map(scene_chroma_key_into_metal),
+                            .and_then(scene_chroma_key_into_metal),
                     });
                 } else {
                     let placeholder =
@@ -2742,7 +2747,8 @@ fn try_gpu_compose(
                 }
             }
             SceneSourceKind::TestPattern => {
-                let pattern = synthetic_test_pattern_bgra(inputs.sequence);
+                let pattern =
+                    synthetic_test_pattern_bgra(inputs.sequence, inputs.width, inputs.height);
                 let (dest, crop) = gpu_source_placement(
                     pattern.width as u32,
                     pattern.height as u32,
@@ -2967,7 +2973,70 @@ fn missing_source_placeholder_bgra(
     }
 }
 
-fn synthetic_test_pattern_bgra(sequence: u64) -> SyntheticTestPatternBgra {
+/// Hard-content mode (VIDEORC_SYNTHETIC_HARD_CONTENT=1): the 64x64 pattern is
+/// trivially cheap to encode at any canvas size, so bridge-pressure defects
+/// (encoder falling behind realtime, ring starvation, latency-contract kills)
+/// are invisible to the smokes — the 0.9.44 regression shipped through green
+/// gates exactly this way. Hard mode paints deterministic per-frame noise at
+/// quarter-canvas resolution: every macroblock changes every frame and the
+/// encoder does real-content work.
+fn synthetic_hard_content_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("VIDEORC_SYNTHETIC_HARD_CONTENT")
+            .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    })
+}
+
+fn xorshift64(state: &mut u64) -> u64 {
+    let mut value = *state;
+    value ^= value << 13;
+    value ^= value >> 7;
+    value ^= value << 17;
+    *state = value;
+    value
+}
+
+fn synthetic_hard_content_bgra(
+    sequence: u64,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> SyntheticTestPatternBgra {
+    let width = (canvas_width as usize / 4).clamp(SYNTHETIC_TEST_PATTERN_WIDTH, 960);
+    let height = (canvas_height as usize / 4).clamp(SYNTHETIC_TEST_PATTERN_HEIGHT, 960);
+    let mut bytes = vec![0; width * height * 4];
+    // Deterministic per (frame, run): reproducible artifacts, zero skip blocks.
+    let mut rng = sequence.wrapping_mul(0x9E37_79B9_7F4A_7C15).max(1);
+    for pixel in bytes.chunks_exact_mut(4) {
+        let noise = xorshift64(&mut rng);
+        pixel[0] = noise as u8;
+        pixel[1] = (noise >> 8) as u8;
+        pixel[2] = (noise >> 16) as u8;
+        pixel[3] = 255;
+    }
+    crate::synthetic_diagnostic::overlay_frame_markers(
+        &mut bytes,
+        width,
+        height,
+        sequence,
+        crate::synthetic_diagnostic::SYNTHETIC_TIMECODE_FPS,
+    );
+    SyntheticTestPatternBgra {
+        bytes,
+        width,
+        height,
+    }
+}
+
+fn synthetic_test_pattern_bgra(
+    sequence: u64,
+    canvas_width: u32,
+    canvas_height: u32,
+) -> SyntheticTestPatternBgra {
+    if synthetic_hard_content_enabled() {
+        return synthetic_hard_content_bgra(sequence, canvas_width, canvas_height);
+    }
     let width = SYNTHETIC_TEST_PATTERN_WIDTH;
     let height = SYNTHETIC_TEST_PATTERN_HEIGHT;
     let mut bytes = vec![0; width * height * 4];
@@ -3968,7 +4037,7 @@ fn render_synthetic_source_rect(
     rect: PixelRect,
     bytes: &mut [u8],
 ) {
-    let pattern = synthetic_test_pattern_bgra(sequence);
+    let pattern = synthetic_test_pattern_bgra(sequence, canvas_width, canvas_height);
     let source = RgbaSource {
         bytes: &pattern.bytes,
         width: pattern.width as u32,
@@ -5155,12 +5224,14 @@ mod tests {
             eprintln!("skipping: no Metal device available in this environment");
             return;
         };
-        // Key green (out), red (kept), a mid green-grey (partial alpha), and
-        // grey (kept + despill-neutral), over a blue background. RGBA order.
+        // A REALISTIC shadowed screen tone (out — the 0.9.39 model failed
+        // here), red (kept), a low-saturation screen tone inside the
+        // saturation-floor ramp (partial alpha), and grey (kept), over a
+        // blue background. RGBA order.
         let pixels: [[u8; 4]; 4] = [
-            [0, 255, 0, 255],
+            [30, 100, 40, 255],
             [255, 0, 0, 255],
-            [74, 181, 74, 255],
+            [100, 135, 100, 255],
             [128, 128, 128, 255],
         ];
         let spec = chroma_key_test_spec();
@@ -5213,7 +5284,7 @@ mod tests {
                     mirror: false,
                     mask: SourceMask::None,
                     blend: true,
-                    chroma_key: Some(scene_chroma_key_into_metal(&spec)),
+                    chroma_key: scene_chroma_key_into_metal(&spec),
                 }],
             )
             .expect("metal compose");
@@ -5238,7 +5309,7 @@ mod tests {
         assert!(gpu_pixels[1] <= 2 && gpu_pixels[2] <= 2);
         // The partial pixel genuinely blended on both paths (neither the
         // background nor the despilled source survives verbatim).
-        let partial_alpha = chroma_key_alpha(&spec, 74, 181, 74);
+        let partial_alpha = chroma_key_alpha(&spec, 100, 135, 100);
         assert!(
             partial_alpha > 0 && partial_alpha < 255,
             "fixture pixel must ramp, got {partial_alpha}"
@@ -5307,8 +5378,8 @@ mod tests {
 
     #[test]
     fn synthetic_test_pattern_bgra_has_spatial_and_temporal_motion() {
-        let first = synthetic_test_pattern_bgra(7);
-        let next = synthetic_test_pattern_bgra(8);
+        let first = synthetic_test_pattern_bgra(7, 1920, 1080);
+        let next = synthetic_test_pattern_bgra(8, 1920, 1080);
 
         assert_eq!(first.width, SYNTHETIC_TEST_PATTERN_WIDTH);
         assert_eq!(first.height, SYNTHETIC_TEST_PATTERN_HEIGHT);
@@ -7541,16 +7612,19 @@ mod tests {
         // Comments upgrade S2: the highlight card (top) and the captions bar
         // (bottom) render in the SAME frame from their independent slots.
         let (canvas_w, canvas_h) = (32_u32, 16_u32);
+        // Solid red (not white): video-range white luma (235) can collide
+        // with bright idle-pattern pixels, making the "overlay changed the
+        // pixel" assertion vacuous.
         let caption = test_caption_overlay(
             8,
             4,
-            [255, 255, 255, 255],
+            [255, 0, 0, 255],
             crate::captions::CaptionOverlayPosition::Bottom,
         );
         let highlight = test_caption_overlay(
             8,
             4,
-            [255, 255, 255, 255],
+            [255, 0, 0, 255],
             crate::captions::CaptionOverlayPosition::Top,
         );
         let base_inputs = CompositorRenderInputs {
@@ -7576,14 +7650,14 @@ mod tests {
             },
             &mut with_both,
         );
-        let (white_y, _, _) = rgb_to_yuv(255, 255, 255);
+        let (red_y, _, _) = rgb_to_yuv(255, 0, 0);
         // Highlight owns the top band (margin = round(16*0.04) = 1 → rows 1..5).
         let top_index = 2 * canvas_w as usize + (canvas_w as usize / 2);
-        assert_eq!(with_both[top_index], white_y);
+        assert_eq!(with_both[top_index], red_y);
         assert_ne!(with_both[top_index], baseline[top_index]);
         // Captions own the bottom band (rows 11..15).
         let bottom_index = 13 * canvas_w as usize + (canvas_w as usize / 2);
-        assert_eq!(with_both[bottom_index], white_y);
+        assert_eq!(with_both[bottom_index], red_y);
         assert_ne!(with_both[bottom_index], baseline[bottom_index]);
     }
 

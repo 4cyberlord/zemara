@@ -169,6 +169,18 @@ export function systemAccessAction({
   ) {
     return 'request-media-access'
   }
+  // Screen Recording gets the same direct Grant treatment as camera/mic. The
+  // main process owns the never-asked/denied distinction (Electron reports
+  // 'denied' for both), so a 'not-determined' here is a true first use and
+  // the request triggers the real macOS prompt.
+  if (
+    appPlatform(platform) === 'darwin' &&
+    pane === 'screen-recording' &&
+    state === 'first-use' &&
+    mediaAccessStatus === 'not-determined'
+  ) {
+    return 'request-media-access'
+  }
   return 'open-settings'
 }
 

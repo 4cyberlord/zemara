@@ -1411,6 +1411,8 @@ describe('normalizeCaptionsCaptureSettings', () => {
       burnTarget: 'stream',
       styleId: 'classic',
       language: 'auto',
+      provider: 'local',
+      deepgramApiKey: null,
       styleRevision: 0,
       position: 'bottom',
       textSize: 'm'
@@ -1421,6 +1423,8 @@ describe('normalizeCaptionsCaptureSettings', () => {
       burnTarget: 'stream',
       styleId: 'glass',
       language: 'auto',
+      provider: 'local',
+      deepgramApiKey: null,
       styleRevision: 0,
       position: 'bottom',
       textSize: 'm'
@@ -1430,6 +1434,8 @@ describe('normalizeCaptionsCaptureSettings', () => {
       burnTarget: 'off',
       styleId: 'glass',
       language: 'auto',
+      provider: 'local',
+      deepgramApiKey: null,
       styleRevision: 0,
       position: 'bottom',
       textSize: 'm'
@@ -1447,6 +1453,8 @@ describe('normalizeCaptionsCaptureSettings', () => {
       burnTarget: 'recording',
       styleId: 'glass',
       language: 'auto',
+      provider: 'local',
+      deepgramApiKey: null,
       styleRevision: 0,
       position: 'top',
       textSize: 'l'
@@ -1456,6 +1464,8 @@ describe('normalizeCaptionsCaptureSettings', () => {
       burnTarget: 'off',
       styleId: 'glass',
       language: 'auto',
+      provider: 'local',
+      deepgramApiKey: null,
       styleRevision: 0,
       position: 'bottom',
       textSize: 'm'
@@ -1479,9 +1489,33 @@ describe('normalizeCaptionsCaptureSettings', () => {
       burnTarget: 'both',
       styleId: 'high-contrast',
       language: 'es',
+      provider: 'local',
+      deepgramApiKey: null,
       styleRevision: 7,
       position: 'top',
       textSize: 's'
+    })
+  })
+
+  it('keeps a valid speech engine and Deepgram key, and rejects junk', async () => {
+    const { normalizeCaptionsCaptureSettings } = await import('./capture')
+    expect(
+      normalizeCaptionsCaptureSettings({
+        provider: 'cloud',
+        deepgramApiKey: '  dg-secret-key  '
+      })
+    ).toMatchObject({
+      provider: 'cloud',
+      deepgramApiKey: 'dg-secret-key'
+    })
+    expect(
+      normalizeCaptionsCaptureSettings({
+        provider: 'neural' as never,
+        deepgramApiKey: '   '
+      })
+    ).toMatchObject({
+      provider: 'local',
+      deepgramApiKey: null
     })
   })
 })

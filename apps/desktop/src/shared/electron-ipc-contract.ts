@@ -57,6 +57,8 @@ export const electronInvokeApiMethods = {
   'app:set-native-theme': 'setNativeTheme',
   'app:quit': 'quitApp',
   'app:set-window-gated': 'setWindowGated',
+  'app:get-screen-access-status': 'getScreenAccessStatus',
+  'app:request-screen-access': 'requestScreenAccess',
   'screens:pick-image': 'pickScreenImage',
   'backgrounds:import-image': 'importBackgroundImage',
   'backgrounds:asset-exists': 'backgroundAssetExists',
@@ -93,6 +95,7 @@ export const electronInvokeApiMethods = {
   'preview-window:set-dock-overlay': 'setPreviewDockOverlayOpen',
   'preview-window:set-aspect-ratio': 'setPreviewWindowAspectRatio',
   'notes-window:open': 'openNotesWindow',
+  'global-shortcuts:set': 'setGlobalShortcuts',
   'notes-window:close': 'closeNotesWindow',
   'notes-window:get-state': 'getNotesWindowState',
   'notes-window:set-always-on-top': 'setNotesWindowAlwaysOnTop',
@@ -165,6 +168,10 @@ export type ElectronInvokeArgs<TChannel extends ElectronInvokeChannel> =
 export type ElectronInvokeResult<TChannel extends ElectronInvokeChannel> =
   ElectronIpcInvokeMap[TChannel]['result']
 
+/** OS-global shortcut actions (registered via globalShortcut, work with the
+ * app unfocused — Stream Deck's native Hotkey action drives these). */
+export type GlobalShortcutAction = 'record-toggle' | 'stream-toggle' | 'mic-toggle'
+
 export interface ElectronIpcEventMap {
   'account:callback': AccountCallbackEnvelope
   'backend:connection': BackendConnection
@@ -189,6 +196,7 @@ export interface ElectronIpcEventMap {
   'captions-window:lines': CaptionsUpdate[]
   'oauth:callback-url': OAuthCallbackEnvelope
   'shortcut:navigate': string
+  'global-shortcuts:triggered': GlobalShortcutAction
   'preview-surface:pump-mode': boolean
   'preview-surface:resync-scene': undefined
   'glass:wallpaper': GlassWallpaperState
@@ -222,6 +230,7 @@ export const electronEventChannels = [
   'captions-window:lines',
   'oauth:callback-url',
   'shortcut:navigate',
+  'global-shortcuts:triggered',
   'preview-surface:pump-mode',
   'preview-surface:resync-scene',
   'glass:wallpaper',
@@ -507,13 +516,45 @@ const notesDocumentSchema = objectSchema(
   { allowUnknown: false }
 )
 
+// Full mirror of LivingTextOutputTheme in shared/backend.ts — when the theme
+// grows a field, this schema must grow it too (regression-tested in
+// electron-ipc-contract.test.ts) or every output-window push gets rejected.
 const livingTextOutputThemeSchema = objectSchema(
   {
-    backgroundColor: stringSchema({ minLength: 1, maxLength: 32 }),
-    textColor: stringSchema({ minLength: 1, maxLength: 32 }),
-    referenceColor: stringSchema({ minLength: 1, maxLength: 32 }),
+    // Background
+    backgroundType: enumSchema(['solid', 'gradient', 'image']),
+    backgroundColor: stringSchema({ minLength: 1, maxLength: 64 }),
+    gradientAngle: numberSchema({ min: 0, max: 360 }),
+    gradientColorStart: stringSchema({ minLength: 1, maxLength: 64 }),
+    gradientColorEnd: stringSchema({ minLength: 1, maxLength: 64 }),
+    backgroundImagePath: nullableSchema(stringSchema({ maxLength: 2048 })),
+    backgroundImageOpacity: numberSchema({ min: 0, max: 1 }),
+    // Verse text
+    textColor: stringSchema({ minLength: 1, maxLength: 64 }),
     fontSize: numberSchema({ min: 8, max: 400 }),
-    textAlign: enumSchema(['left', 'center', 'right'])
+    fontFamily: stringSchema({ minLength: 1, maxLength: 512 }),
+    fontWeight: numberSchema({ min: 100, max: 900 }),
+    lineHeight: numberSchema({ min: 0.5, max: 4 }),
+    letterSpacing: numberSchema({ min: 0, max: 1 }),
+    textAlign: enumSchema(['left', 'center', 'right']),
+    textShadowBlur: numberSchema({ min: 0, max: 200 }),
+    textShadowX: numberSchema({ min: -100, max: 100 }),
+    textShadowY: numberSchema({ min: -100, max: 100 }),
+    textShadowColor: stringSchema({ minLength: 1, maxLength: 64 }),
+    textStrokeWidth: numberSchema({ min: 0, max: 40 }),
+    textStrokeColor: stringSchema({ minLength: 1, maxLength: 64 }),
+    // Reference line
+    referenceColor: stringSchema({ minLength: 1, maxLength: 64 }),
+    referenceAlign: enumSchema(['left', 'center', 'right']),
+    referenceFontSize: numberSchema({ min: 0, max: 400 }),
+    // Layout
+    verticalPosition: enumSchema(['top', 'center', 'bottom']),
+    horizontalPaddingPct: numberSchema({ min: 0, max: 45 }),
+    maxWidthPct: numberSchema({ min: 10, max: 100 }),
+    // Output
+    displayMode: enumSchema(['fullscreen', 'lower-third']),
+    resolutionWidth: numberSchema({ integer: true, min: 16, max: 7680 }),
+    resolutionHeight: numberSchema({ integer: true, min: 16, max: 7680 })
   },
   { allowUnknown: false }
 )
@@ -910,6 +951,7 @@ export const boundedPassthroughElectronInvokeChannels = [
   'preview-window:report-dock-slot',
   'preview-window:set-dock-overlay',
   'notes-window:open',
+  'global-shortcuts:set',
   'notes-window:close',
   'notes-window:get-state',
   'notes-window:set-always-on-top',
@@ -947,6 +989,8 @@ export const boundedPassthroughElectronInvokeChannels = [
   'system:open-permissions',
   'system:media-access-status',
   'system:request-media-access',
+  'app:get-screen-access-status',
+  'app:request-screen-access',
   'system:reveal-permission-target',
   'system:pick-file',
   'system:pick-directory',
@@ -1042,6 +1086,7 @@ const specificRuntimeEventSchemas = {
     'U',
     'T'
   ]),
+  'global-shortcuts:triggered': enumSchema(['record-toggle', 'stream-toggle', 'mic-toggle']),
   'preview-surface:pump-mode': booleanSchema,
   'preview-surface:resync-scene': undefinedSchema,
   'captions-window:lines': runtimeSchema<unknown[]>('bounded caption lines', (value, path) => {

@@ -58,6 +58,20 @@ pub struct AdminRegisterParams {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct AdminAuthLoginParams {
+    /// Optional override — the sign-in gate may run before Settings >
+    /// Database has a stored URL. Falls back to the stored connection URL.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    pub email: String,
+    pub password: String,
+    /// Only needed when the same email+password exists at several churches.
+    #[serde(default)]
+    pub organization: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LivingTextSyncParams {
     pub translation_code: String,
 }
@@ -75,6 +89,27 @@ pub struct LivingTextChapterParams {
 pub struct LivingTextDetectParams {
     pub translation_code: String,
     pub text: String,
+}
+
+/// Params for `livingText.search` — FTS5-powered full-text verse search.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LivingTextSearchParams {
+    pub translation_code: String,
+    pub query: String,
+    /// Optional canonical book name to narrow results to a single book.
+    pub book: Option<String>,
+    /// Maximum results to return. Defaults to 100 if absent.
+    pub limit: Option<usize>,
+}
+
+/// Params for `livingText.crossRef` — resolve a reference string to verses.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LivingTextCrossRefParams {
+    pub translation_code: String,
+    /// Free-text that may contain one or more Bible references, e.g. "John 3:16".
+    pub reference_text: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -854,6 +889,10 @@ pub struct OutputSettings {
     pub stream_enabled: bool,
     pub output_directory: Option<String>,
     pub ffmpeg_path: Option<String>,
+    /// Keep the capture MKV (lossless PCM audio) next to the exported MP4
+    /// instead of removing it after a committed export. Off by default.
+    #[serde(default)]
+    pub keep_original_mkv: bool,
     pub video: VideoSettings,
     pub rtmp: RtmpSettings,
 }
@@ -956,6 +995,13 @@ pub struct CaptionsSessionParams {
     pub style_id: crate::captions::CaptionStyleId,
     #[serde(default = "default_caption_language")]
     pub language: String,
+    /// Speech engine preference for this session: on-device, or a network
+    /// provider (Deepgram when a key is present, else the signed-in gateway).
+    #[serde(default)]
+    pub provider: crate::captions::CaptionProviderPreference,
+    /// Operator's own Deepgram key — used only when `provider` is Cloud.
+    #[serde(default)]
+    pub deepgram_api_key: Option<String>,
     #[serde(default)]
     pub style_revision: u64,
 }
@@ -971,6 +1017,10 @@ impl Default for CaptionsSessionParams {
             text_size: crate::captions::CaptionTextSize::M,
             style_id: crate::captions::CaptionStyleId::Classic,
             language: default_caption_language(),
+            // Older clients omit the engine: keep them on the gateway rather
+            // than silently switching them to a model they never downloaded.
+            provider: crate::captions::CaptionProviderPreference::Cloud,
+            deepgram_api_key: None,
             style_revision: 0,
         }
     }
@@ -1255,6 +1305,10 @@ pub enum EncodeBackend {
     HardwareMediaFoundation,
     /// h264_mf's software MFT fallback after the exact hardware profile probe failed.
     SoftwareMediaFoundation,
+    /// libopenh264 (software), the Windows fallback after the hardware probe
+    /// failed — software Media Foundation ran below realtime on real devices
+    /// (issue #149).
+    SoftwareOpenH264,
 }
 
 /// Which compositor rendered the active shared-compositor frame.
@@ -2522,6 +2576,112 @@ pub struct SessionSummary {
     pub processing_kind: Option<String>,
 }
 
+/// Bounded, renderer-facing Library row. Histories intentionally live behind
+/// their cursor-paginated detail methods so refreshing the Library never
+/// serializes every event, log line, or AI payload for every session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionListItem {
+    pub id: String,
+    pub title: String,
+    pub started_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<String>,
+    pub status: String,
+    pub mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mp4_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_preset: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub container: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub file_size_bytes: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scene_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quality_status: Option<GateStatus>,
+    pub health_event_count: u64,
+    pub session_log_count: u64,
+    pub ai_artifact_count: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ready_ai_artifact_kinds: Vec<AiArtifactKind>,
+    pub comment_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub derived_from_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub processing_kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionListPage {
+    pub items: Vec<SessionListItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionListParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default = "default_session_list_page_limit")]
+    pub limit: usize,
+}
+
+pub const DEFAULT_SESSION_LIST_PAGE_LIMIT: usize = 50;
+
+fn default_session_list_page_limit() -> usize {
+    DEFAULT_SESSION_LIST_PAGE_LIMIT
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionDetailListParams {
+    pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default = "default_session_detail_page_limit")]
+    pub limit: usize,
+}
+
+pub const DEFAULT_SESSION_DETAIL_PAGE_LIMIT: usize = 120;
+
+fn default_session_detail_page_limit() -> usize {
+    DEFAULT_SESSION_DETAIL_PAGE_LIMIT
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionHealthEventsPage {
+    pub events: Vec<HealthEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionLogsPage {
+    pub entries: Vec<SessionLogEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionAiArtifactsPage {
+    pub artifacts: Vec<AiArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum NoiseCleanupJobStatus {
@@ -3441,6 +3601,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(EncodeBackend::SoftwareMediaFoundation).unwrap(),
             serde_json::json!("software-media-foundation")
+        );
+        assert_eq!(
+            serde_json::to_value(EncodeBackend::SoftwareOpenH264).unwrap(),
+            serde_json::json!("software-open-h264")
         );
     }
 

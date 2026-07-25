@@ -1,6 +1,6 @@
 {
   "name": "@videorc/desktop",
-  "version": "0.9.43",
+  "version": "0.9.47",
   "private": true,
   "main": "./out/main/index.js",
   "description": "Zemara desktop app.",
@@ -9,8 +9,11 @@
   "scripts": {
     "dev": "pnpm --dir ../.. build:native-preview-addon && electron-vite dev",
     "build": "electron-vite build",
-    "package": "pnpm build && electron-builder --dir --config.mac.identity=null --config.mac.notarize=false",
+    "package": "pnpm build && electron-builder --dir --config.mac.notarize=false",
     "dist": "pnpm build && electron-builder --config.mac.identity=null --config.mac.notarize=false --config.dmg.sign=false",
+    "package:windows:unsigned": "pnpm build && electron-builder --win dir --publish never --config electron-builder.windows-unsigned.cjs",
+    "dist:windows:prepackaged": "electron-builder --win nsis --publish never --prepackaged release/win-unpacked --config electron-builder.windows-signed.cjs",
+    "dist:windows:signed": "pnpm dist:windows:prepackaged",
     "dist:signed": "pnpm build && electron-builder --mac dmg",
     "dist:release": "pnpm build && APPLE_TEAM_ID=C2PA37RB58 electron-builder --publish never && node scripts/staple-dmg.mjs",
     "release:upload": "node scripts/release-upload.mjs",
@@ -18,11 +21,13 @@
     "test": "vitest run"
   },
   "dependencies": {
+    "@computer-use/mac-screen-capture-permissions": "^1.0.2",
     "@phosphor-icons/react": "^2.1.10",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "cmdk": "^1.1.1",
     "electron-updater": "^6.8.9",
+    "immer": "^11.1.11",
     "maplibre-gl": "^5.24.0",
     "next-themes": "^0.4.6",
     "qrcode": "^1.5.4",

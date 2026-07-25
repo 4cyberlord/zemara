@@ -83,6 +83,19 @@ const FIFO_FRAME_WRITE_HARD_TIMEOUT: Duration = Duration::from_secs(2);
 const RAW_VIDEO_FIFO_FRAME_WRITE_HARD_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(not(target_os = "windows"))]
 const RAW_VIDEO_FIFO_FRAME_WRITE_HARD_TIMEOUT: Duration = FIFO_FRAME_WRITE_HARD_TIMEOUT;
+// The raw writer's NO-PROGRESS tolerance is a PLATFORM contract, decoupled
+// from the output queue's age budget. Issue #149 (real Windows device): the
+// software Media Foundation MFT pauses draining the raw pipe for seconds at a
+// time; the writer was using the recording queue's 250ms max_frame_age both
+// as the initial deadline (anchored at SUBMIT time, so a frame that waited in
+// the latest-wins mailbox was dead before its first byte) and as the sliding
+// no-progress window — making the 30s Windows hard timeout unreachable and
+// killing healthy recordings ~1s in. Late is fine for a file; only a truly
+// wedged pipe (no bytes for this long) is fatal.
+#[cfg(target_os = "windows")]
+const RAW_VIDEO_FIFO_WRITE_STALL_TOLERANCE: Duration = Duration::from_secs(10);
+#[cfg(not(target_os = "windows"))]
+const RAW_VIDEO_FIFO_WRITE_STALL_TOLERANCE: Duration = FIFO_FRAME_WRITE_HARD_TIMEOUT;
 const RAW_VIDEO_FIFO_STARTUP_PRIME_TIMEOUT: Duration = Duration::from_millis(2500);
 const FIFO_WRITE_PROGRESS_YIELD_BUDGET: u32 = 64;
 const FIFO_WRITE_STALL_BACKOFF: Duration = Duration::from_micros(250);
@@ -202,25 +215,30 @@ fn encoder_bridge_pre_encode_admission(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EncoderBridgeOverBudgetEscalation {
-    /// Keep the output alive: drop pre-encode like coalescing and re-check.
+    /// Keep the stream output alive: drop pre-encode like coalescing and re-check.
     Degrade,
+    /// Keep the recording output alive WITHOUT dropping: frames keep
+    /// submitting late while the encoder catches up. Late is fine for a
+    /// file; only wedged is fatal.
+    SubmitUnderPressure,
     /// The violation is sustained (or the queue truly full): fail the output.
     Fail,
 }
 
-/// Only the stream role degrades — its latest-wins coalescing makes dropped
-/// frames an honest, visible quality trade. Recording/shared outputs have no
-/// such semantics: silently dropping recording frames is exactly the
-/// corruption the contract exists to prevent, so they fail immediately.
+/// Over-budget posture is role-specific. The stream role DEGRADES — its
+/// latest-wins coalescing makes dropped frames an honest, visible quality
+/// trade. Recording/shared outputs must never drop (that is the corruption
+/// the contract prevents) but they also have no downstream latency consumer:
+/// they SUBMIT UNDER PRESSURE and fail only when the breach is sustained.
+/// A single over-age sample used to kill a recording outright — the
+/// 2026-07-16 owner incident lost a 4K session 2s in at "oldest 251/250ms"
+/// while the encoder was merely warming up (depth 6/16, still progressing).
 fn encoder_bridge_over_budget_escalation(
     policy: EncoderBridgeOutputQueuePolicy,
     queue_depth: u64,
     over_budget_since: Instant,
     now: Instant,
 ) -> EncoderBridgeOverBudgetEscalation {
-    if policy.role != EncoderBridgeOutputRole::Stream {
-        return EncoderBridgeOverBudgetEscalation::Fail;
-    }
     // A queue at its frame ceiling means the consumer made no progress across
     // the whole depth ladder — that is not jitter.
     if queue_depth >= policy.max_frames as u64 {
@@ -229,7 +247,11 @@ fn encoder_bridge_over_budget_escalation(
     if now.duration_since(over_budget_since) >= STREAM_OUTPUT_SUSTAINED_FAIL_WINDOW {
         return EncoderBridgeOverBudgetEscalation::Fail;
     }
-    EncoderBridgeOverBudgetEscalation::Degrade
+    if policy.role == EncoderBridgeOutputRole::Stream {
+        EncoderBridgeOverBudgetEscalation::Degrade
+    } else {
+        EncoderBridgeOverBudgetEscalation::SubmitUnderPressure
+    }
 }
 
 fn encoder_bridge_output_pressure_error(
@@ -756,6 +778,10 @@ pub fn start_synthetic_recording_bridge(
     frame_store: Option<CompositorFrameStore>,
     video_output: EncoderBridgeVideoOutput,
     bitrate_kbps: Option<u32>,
+    // True when a live leg consumes this output (streaming posture: speed over
+    // quality, 1-frame delay cap). Record-only outputs pass false and the
+    // VideoToolbox session spends its headroom on quality instead.
+    low_latency: bool,
     diagnostics_context: EncoderBridgeDiagnosticsContext,
     // Set once at the bridge's first delivered frame: the shared session epoch the
     // audio FIFO writer aligns to (Studio Shell And Live Control Plan, slice A2).
@@ -800,6 +826,7 @@ pub fn start_synthetic_recording_bridge(
                 frame_store,
                 video_output,
                 bitrate_kbps,
+                low_latency,
                 diagnostics_context,
                 stop: writer_stop,
                 terminal_failure: writer_terminal_failure,
@@ -997,6 +1024,7 @@ struct SyntheticRecordingWriterParams {
     frame_store: Option<CompositorFrameStore>,
     video_output: EncoderBridgeVideoOutput,
     bitrate_kbps: Option<u32>,
+    low_latency: bool,
     diagnostics_tx: watch::Sender<Option<EncoderBridgeWriterEvent>>,
     diagnostics_context: EncoderBridgeDiagnosticsContext,
     video_epoch: Arc<OnceLock<Instant>>,
@@ -1025,6 +1053,7 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
         frame_store,
         video_output,
         bitrate_kbps,
+        low_latency,
         diagnostics_tx,
         diagnostics_context,
         video_epoch,
@@ -1186,6 +1215,7 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
         height,
         target_fps,
         bitrate_kbps,
+        low_latency,
     );
     #[cfg(target_os = "macos")]
     if video_output.uses_video_toolbox()
@@ -1300,14 +1330,14 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
         compositor_wait_times_ms.push(prime_wait_started_at.elapsed().as_secs_f64() * 1000.0);
         let submitted_at = Instant::now();
         let queued_prime = match prime_frame.as_ref() {
-            Some(frame) => QueuedRawVideoFrame::compositor(frame, submitted_at),
+            Some(frame) => QueuedRawVideoFrame::compositor(frame),
             None => {
                 synthetic_fallback_frames = synthetic_fallback_frames.saturating_add(1);
                 let frame = source.render(1, width, height);
                 let mut bytes =
                     take_recycled_synthetic_buffer(&mut recycled_synthetic_buffer, byte_len);
                 render_synthetic_yuv420p_frame(&frame, &mut bytes);
-                QueuedRawVideoFrame::synthetic(bytes, submitted_at)
+                QueuedRawVideoFrame::synthetic(bytes)
             }
         };
         let prime_enqueue = raw_fifo_writer
@@ -1567,6 +1597,17 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
                     EncoderBridgeOverBudgetEscalation::Degrade => {
                         EncoderBridgePreEncodeAdmission::CoalesceLatestStreamFrame
                     }
+                    EncoderBridgeOverBudgetEscalation::SubmitUnderPressure => {
+                        // Recording keeps every frame: submit late, surface
+                        // pressure in stats, never drop.
+                        output_queue_capacity_pressure_events =
+                            output_queue_capacity_pressure_events.saturating_add(1);
+                        tracing::warn!(
+                            "Recording encoder output over its age budget (depth {queue_depth}, since {:?} ago); submitting under pressure instead of failing.",
+                            now.duration_since(since)
+                        );
+                        EncoderBridgePreEncodeAdmission::Submit
+                    }
                     EncoderBridgeOverBudgetEscalation::Fail => {
                         EncoderBridgePreEncodeAdmission::FailOutput
                     }
@@ -1792,7 +1833,7 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
                 EncoderBridgeVideoOutput::RawYuv420p => {
                     let submitted_at = Instant::now();
                     let queued_frame = match fed.as_ref() {
-                        Some(frame) => QueuedRawVideoFrame::compositor(frame, submitted_at),
+                        Some(frame) => QueuedRawVideoFrame::compositor(frame),
                         None => {
                             let frame = source.render(sequence, width, height);
                             let mut bytes = take_recycled_synthetic_buffer(
@@ -1800,7 +1841,7 @@ fn write_synthetic_recording_frames(params: SyntheticRecordingWriterParams) {
                                 byte_len,
                             );
                             render_synthetic_yuv420p_frame(&frame, &mut bytes);
-                            QueuedRawVideoFrame::synthetic(bytes, submitted_at)
+                            QueuedRawVideoFrame::synthetic(bytes)
                         }
                     };
                     match raw_fifo_writer
@@ -2316,6 +2357,7 @@ struct VideoToolboxBridgeEncoderConfig {
     expected_frame_rate: i32,
     max_key_frame_interval: i32,
     average_bit_rate_bps: Option<i64>,
+    low_latency: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -2325,6 +2367,7 @@ impl VideoToolboxBridgeEncoderConfig {
         height: u32,
         fps: u32,
         bitrate_kbps: Option<u32>,
+        low_latency: bool,
     ) -> Self {
         let expected_frame_rate = i32::try_from(fps.max(1)).unwrap_or(i32::MAX);
         Self {
@@ -2334,6 +2377,7 @@ impl VideoToolboxBridgeEncoderConfig {
             max_key_frame_interval: expected_frame_rate.saturating_mul(2).max(1),
             average_bit_rate_bps: bitrate_kbps
                 .map(|bitrate_kbps| i64::from(bitrate_kbps).saturating_mul(1_000)),
+            low_latency,
         }
     }
 }
@@ -2361,7 +2405,14 @@ enum VideoToolboxProbeOutcome {
 
 #[cfg(target_os = "macos")]
 impl EncoderBridgeVideoToolboxProbe {
-    fn new(enabled: bool, width: u32, height: u32, fps: u32, bitrate_kbps: Option<u32>) -> Self {
+    fn new(
+        enabled: bool,
+        width: u32,
+        height: u32,
+        fps: u32,
+        bitrate_kbps: Option<u32>,
+        low_latency: bool,
+    ) -> Self {
         let (output_tx, output_rx) =
             std_mpsc::sync_channel(VIDEOTOOLBOX_CALLBACK_OUTPUT_QUEUE_FRAMES);
         let rejected_output_frames = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -2372,6 +2423,7 @@ impl EncoderBridgeVideoToolboxProbe {
                 height,
                 fps,
                 bitrate_kbps,
+                low_latency,
             ),
             session: None,
             output_tx,
@@ -2500,21 +2552,14 @@ impl EncoderBridgeVideoToolboxProbe {
     }
 
     fn prepare_session(&mut self) -> Result<()> {
-        let session = match self.config.average_bit_rate_bps {
-            Some(average_bit_rate_bps) => VideoToolboxH264Session::new_realtime_with_bitrate(
-                self.config.width,
-                self.config.height,
-                self.config.expected_frame_rate,
-                self.config.max_key_frame_interval,
-                average_bit_rate_bps,
-            )?,
-            None => VideoToolboxH264Session::new_realtime(
-                self.config.width,
-                self.config.height,
-                self.config.expected_frame_rate,
-                self.config.max_key_frame_interval,
-            )?,
-        };
+        let session = VideoToolboxH264Session::new_tuned(
+            self.config.width,
+            self.config.height,
+            self.config.expected_frame_rate,
+            self.config.max_key_frame_interval,
+            self.config.average_bit_rate_bps,
+            self.config.low_latency,
+        )?;
         session.prepare()?;
         self.session = Some(session);
         Ok(())
@@ -2616,27 +2661,27 @@ impl RawVideoFramePayload {
     }
 }
 
+// Carries NO timestamp on purpose (#149): frame age is a queue-admission
+// concern; once a frame reaches the writer it is written or the pipe is
+// declared stalled — the writer must be structurally unable to drop by age.
 struct QueuedRawVideoFrame {
     payload: RawVideoFramePayload,
-    submitted_at: Instant,
     had_metal_target: bool,
     had_metal_export_handle: bool,
 }
 
 impl QueuedRawVideoFrame {
-    fn compositor(frame: &FedCompositorFrame, submitted_at: Instant) -> Self {
+    fn compositor(frame: &FedCompositorFrame) -> Self {
         Self {
             payload: RawVideoFramePayload::Compositor(Arc::clone(&frame.frame)),
-            submitted_at,
             had_metal_target: frame.has_metal_iosurface_target,
             had_metal_export_handle: frame.has_metal_export_handle,
         }
     }
 
-    fn synthetic(bytes: Vec<u8>, submitted_at: Instant) -> Self {
+    fn synthetic(bytes: Vec<u8>) -> Self {
         Self {
             payload: RawVideoFramePayload::Synthetic(bytes),
-            submitted_at,
             had_metal_target: false,
             had_metal_export_handle: false,
         }
@@ -2690,7 +2735,6 @@ impl RawVideoFifoWriter {
                     || writer_mailbox.receive(),
                     result_tx,
                     stop,
-                    policy.max_age,
                     terminal_failure,
                     policy.role,
                 );
@@ -2754,7 +2798,6 @@ fn run_raw_video_fifo_writer_loop<W: StdWrite>(
     frame_rx: std_mpsc::Receiver<QueuedRawVideoFrame>,
     result_tx: std_mpsc::SyncSender<RawVideoFifoWriterResult>,
     stop: Arc<AtomicBool>,
-    max_frame_age: Duration,
     terminal_failure: Arc<StdMutex<Option<String>>>,
     role: EncoderBridgeOutputRole,
 ) {
@@ -2763,7 +2806,6 @@ fn run_raw_video_fifo_writer_loop<W: StdWrite>(
         || frame_rx.recv().ok(),
         result_tx,
         stop,
-        max_frame_age,
         terminal_failure,
         role,
     );
@@ -2774,7 +2816,6 @@ fn run_raw_video_fifo_writer_loop_with_receiver<W, F>(
     mut receive: F,
     result_tx: std_mpsc::SyncSender<RawVideoFifoWriterResult>,
     stop: Arc<AtomicBool>,
-    max_frame_age: Duration,
     terminal_failure: Arc<StdMutex<Option<String>>>,
     role: EncoderBridgeOutputRole,
 ) where
@@ -2783,17 +2824,22 @@ fn run_raw_video_fifo_writer_loop_with_receiver<W, F>(
 {
     while let Some(frame) = receive() {
         let write_started_at = Instant::now();
-        let deadline = frame.submitted_at + max_frame_age;
+        // The deadline anchors at WRITE START, not submit time: a latest-wins
+        // frame that waited out an encoder pause is still valid recording
+        // content — a recording tolerates late frames, never dropped ones
+        // (issue #149). Progress is judged by the platform stall tolerance;
+        // the hard timeout bounds the whole frame.
+        let deadline = write_started_at + RAW_VIDEO_FIFO_WRITE_STALL_TOLERANCE;
         // Once any raw frame bytes reach FFmpeg, stopping mid-frame would
         // misalign every following YUV plane and can corrupt the final file.
-        // Finish the in-flight frame within its existing age deadline; closing
-        // the queue prevents any new work from being admitted during stop.
+        // Finish the in-flight frame; closing the queue prevents any new work
+        // from being admitted during stop.
         match write_all_until(
             &mut sink,
             frame.bytes(),
             &stop,
             deadline,
-            max_frame_age,
+            RAW_VIDEO_FIFO_WRITE_STALL_TOLERANCE,
             RAW_VIDEO_FIFO_FRAME_WRITE_HARD_TIMEOUT,
             false,
         ) {
@@ -4213,7 +4259,7 @@ mod tests {
     }
 
     #[test]
-    fn recording_over_budget_never_degrades() {
+    fn recording_over_budget_submits_under_pressure_then_fails_when_sustained() {
         for role in [
             EncoderBridgeOutputRole::Recording,
             EncoderBridgeOutputRole::Shared,
@@ -4223,10 +4269,36 @@ mod tests {
                 ..EncoderBridgeDiagnosticsContext::default()
             });
             let since = Instant::now();
-            // Dropping recording frames silently is the corruption the
-            // contract prevents — recording outputs keep the one-sample fail.
+            // Recording outputs never drop, but a single over-age sample is no
+            // longer a death sentence (2026-07-16 owner incident: 4K session
+            // killed 2s in at "oldest 251/250ms" during encoder warmup): they
+            // submit under pressure and fail only when sustained.
             assert_eq!(
-                encoder_bridge_over_budget_escalation(policy, 2, since, since),
+                encoder_bridge_over_budget_escalation(policy, 6, since, since),
+                EncoderBridgeOverBudgetEscalation::SubmitUnderPressure
+            );
+            assert_eq!(
+                encoder_bridge_over_budget_escalation(
+                    policy,
+                    6,
+                    since,
+                    since + STREAM_OUTPUT_SUSTAINED_FAIL_WINDOW - Duration::from_millis(1),
+                ),
+                EncoderBridgeOverBudgetEscalation::SubmitUnderPressure
+            );
+            // Continuously over budget for the whole window → real failure.
+            assert_eq!(
+                encoder_bridge_over_budget_escalation(
+                    policy,
+                    6,
+                    since,
+                    since + STREAM_OUTPUT_SUSTAINED_FAIL_WINDOW,
+                ),
+                EncoderBridgeOverBudgetEscalation::Fail
+            );
+            // A queue at its frame ceiling is a stalled consumer — immediate.
+            assert_eq!(
+                encoder_bridge_over_budget_escalation(policy, 16, since, since),
                 EncoderBridgeOverBudgetEscalation::Fail
             );
         }
@@ -4331,11 +4403,11 @@ mod tests {
     fn busy_raw_fifo_replaces_the_pending_frame_with_the_latest_tick() {
         let mailbox = LatestRawVideoFrameMailbox::default();
         assert!(matches!(
-            mailbox.offer(QueuedRawVideoFrame::synthetic(vec![1], Instant::now())),
+            mailbox.offer(QueuedRawVideoFrame::synthetic(vec![1])),
             Ok(LatestRawVideoFrameOffer::Enqueued)
         ));
         let replaced = mailbox
-            .offer(QueuedRawVideoFrame::synthetic(vec![2], Instant::now()))
+            .offer(QueuedRawVideoFrame::synthetic(vec![2]))
             .unwrap_or_else(|_| panic!("latest frame mailbox remains open"));
         let LatestRawVideoFrameOffer::Replaced(frame) = replaced else {
             panic!("second tick must replace the pending first tick")
@@ -4396,10 +4468,7 @@ mod tests {
         let (result_tx, result_rx) = std_mpsc::sync_channel(4);
         let sink = SharedCountingSink::default();
         frame_tx
-            .send(QueuedRawVideoFrame::synthetic(
-                vec![1, 2, 3, 4],
-                Instant::now(),
-            ))
+            .send(QueuedRawVideoFrame::synthetic(vec![1, 2, 3, 4]))
             .expect("queue raw frame");
         drop(frame_tx);
 
@@ -4408,7 +4477,6 @@ mod tests {
             frame_rx,
             result_tx,
             Arc::new(AtomicBool::new(false)),
-            Duration::from_millis(250),
             Arc::new(StdMutex::new(None)),
             EncoderBridgeOutputRole::Recording,
         );
@@ -4438,7 +4506,7 @@ mod tests {
                 .expect("shared compositor frame");
         assert!(Arc::ptr_eq(&published, &fed.frame));
 
-        let queued = QueuedRawVideoFrame::compositor(&fed, Instant::now());
+        let queued = QueuedRawVideoFrame::compositor(&fed);
         assert_eq!(queued.bytes().as_ptr(), published.bytes.as_ptr());
         let retained_before_write = Arc::strong_count(&published);
         drop(fed);
@@ -4454,7 +4522,6 @@ mod tests {
             frame_rx,
             result_tx,
             Arc::new(AtomicBool::new(false)),
-            Duration::from_millis(250),
             Arc::new(StdMutex::new(None)),
             EncoderBridgeOutputRole::Recording,
         );
@@ -4490,7 +4557,6 @@ mod tests {
                 || writer_mailbox.receive(),
                 result_tx,
                 Arc::new(AtomicBool::new(false)),
-                Duration::from_millis(250),
                 Arc::new(StdMutex::new(None)),
                 EncoderBridgeOutputRole::Recording,
             );
@@ -4498,7 +4564,7 @@ mod tests {
 
         assert!(matches!(
             mailbox
-                .offer(QueuedRawVideoFrame::synthetic(vec![0], Instant::now()))
+                .offer(QueuedRawVideoFrame::synthetic(vec![0]))
                 .unwrap_or_else(|_| panic!("raw mailbox remains open")),
             LatestRawVideoFrameOffer::Enqueued
         ));
@@ -4507,12 +4573,12 @@ mod tests {
             .expect("writer starts the first frame");
         assert!(matches!(
             mailbox
-                .offer(QueuedRawVideoFrame::synthetic(vec![1], Instant::now()))
+                .offer(QueuedRawVideoFrame::synthetic(vec![1]))
                 .unwrap_or_else(|_| panic!("raw mailbox remains open")),
             LatestRawVideoFrameOffer::Enqueued
         ));
         let replacement = mailbox
-            .offer(QueuedRawVideoFrame::synthetic(vec![2], Instant::now()))
+            .offer(QueuedRawVideoFrame::synthetic(vec![2]))
             .unwrap_or_else(|_| panic!("raw mailbox remains open"));
         let LatestRawVideoFrameOffer::Replaced(replaced) = replacement else {
             panic!("latest tick must replace the pending frame while the writer is blocked")
@@ -4545,6 +4611,49 @@ mod tests {
     }
 
     #[test]
+    fn raw_fifo_writer_writes_a_frame_older_than_any_queue_age_budget() {
+        // Issue #149: the deadline was anchored at SUBMIT time with the
+        // recording queue's 250ms age budget, so a latest-wins frame that
+        // waited out a Media Foundation pause was declared dead before its
+        // first byte. Recording semantics: late frames are written, not
+        // dropped — QueuedRawVideoFrame now carries no timestamp at all, so
+        // the writer cannot even observe how long a frame waited; only a
+        // truly stalled pipe (zero byte progress for the platform stall
+        // tolerance) is fatal.
+        let (result_tx, result_rx) = std_mpsc::sync_channel(4);
+        let stale = QueuedRawVideoFrame::synthetic(vec![7; 32]);
+        let mut frames = vec![stale].into_iter();
+        let mut sink: Vec<u8> = Vec::new();
+        run_raw_video_fifo_writer_loop_with_receiver(
+            &mut sink,
+            || frames.next(),
+            result_tx,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(StdMutex::new(None)),
+            EncoderBridgeOutputRole::Recording,
+        );
+        assert_eq!(sink, vec![7; 32], "the stale frame must still be written");
+        assert!(matches!(
+            result_rx.try_recv(),
+            Ok(RawVideoFifoWriterResult::FrameWritten { .. })
+        ));
+    }
+
+    #[test]
+    fn raw_fifo_write_stall_tolerance_is_a_platform_contract_not_the_queue_age() {
+        // The sliding no-progress window must come from the platform contract
+        // (Media Foundation pauses for seconds on Windows), never from the
+        // 250ms recording queue budget that killed real recordings in #149.
+        assert!(RAW_VIDEO_FIFO_WRITE_STALL_TOLERANCE > RECORDING_OUTPUT_QUEUE_MAX_AGE);
+        assert!(RAW_VIDEO_FIFO_WRITE_STALL_TOLERANCE <= RAW_VIDEO_FIFO_FRAME_WRITE_HARD_TIMEOUT);
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            RAW_VIDEO_FIFO_WRITE_STALL_TOLERANCE,
+            Duration::from_secs(10)
+        );
+    }
+
+    #[test]
     fn raw_fifo_writer_uses_a_windows_safe_complete_frame_timeout() {
         #[cfg(target_os = "windows")]
         assert_eq!(
@@ -4566,10 +4675,7 @@ mod tests {
         let written = SharedCountingSink::default();
         let frame = vec![1, 2, 3, 4, 5, 6, 7, 8];
         frame_tx
-            .send(QueuedRawVideoFrame::synthetic(
-                frame.clone(),
-                Instant::now(),
-            ))
+            .send(QueuedRawVideoFrame::synthetic(frame.clone()))
             .expect("queue raw frame");
         drop(frame_tx);
 
@@ -4582,7 +4688,6 @@ mod tests {
             frame_rx,
             result_tx,
             stop,
-            Duration::from_millis(250),
             Arc::new(StdMutex::new(None)),
             EncoderBridgeOutputRole::Recording,
         );
@@ -4602,10 +4707,7 @@ mod tests {
         let written = SharedCountingSink::default();
         let frame = vec![1, 2, 3, 4, 5, 6, 7, 8];
         frame_tx
-            .send(QueuedRawVideoFrame::synthetic(
-                frame.clone(),
-                Instant::now(),
-            ))
+            .send(QueuedRawVideoFrame::synthetic(frame.clone()))
             .expect("queue raw frame");
         drop(frame_tx);
 
@@ -4618,7 +4720,6 @@ mod tests {
             frame_rx,
             result_tx,
             Arc::new(AtomicBool::new(false)),
-            Duration::from_millis(20),
             Arc::new(StdMutex::new(None)),
             EncoderBridgeOutputRole::Recording,
         );
@@ -4692,10 +4793,7 @@ mod tests {
         let (frame_tx, frame_rx) = std_mpsc::sync_channel(1);
         let (result_tx, result_rx) = std_mpsc::sync_channel(3);
         frame_tx
-            .send(QueuedRawVideoFrame::synthetic(
-                vec![0x44; 64],
-                Instant::now(),
-            ))
+            .send(QueuedRawVideoFrame::synthetic(vec![0x44; 64]))
             .expect("queue raw frame");
         drop(frame_tx);
 
@@ -4706,12 +4804,15 @@ mod tests {
             frame_rx,
             result_tx,
             Arc::new(AtomicBool::new(false)),
-            Duration::from_millis(20),
             terminal_failure.clone(),
             EncoderBridgeOutputRole::Recording,
         );
 
-        assert!(started_at.elapsed() < Duration::from_millis(500));
+        // A wedged pipe fails within the PLATFORM stall tolerance (#149: no
+        // longer the 250ms queue budget) plus scheduling slack.
+        assert!(
+            started_at.elapsed() < RAW_VIDEO_FIFO_WRITE_STALL_TOLERANCE + Duration::from_secs(1)
+        );
         let result = result_rx.recv().expect("terminal raw writer result");
         let RawVideoFifoWriterResult::Error { message, .. } = result else {
             panic!("stalled raw writer must fail explicitly")
@@ -4951,25 +5052,38 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn videotoolbox_config_maps_4k30_recording_profile_to_realtime_h264_settings() {
-        let config =
-            VideoToolboxBridgeEncoderConfig::from_recording_profile(3840, 2160, 30, Some(30_000));
+        let config = VideoToolboxBridgeEncoderConfig::from_recording_profile(
+            3840,
+            2160,
+            30,
+            Some(30_000),
+            false,
+        );
 
         assert_eq!(config.width, 3840);
         assert_eq!(config.height, 2160);
         assert_eq!(config.expected_frame_rate, 30);
         assert_eq!(config.max_key_frame_interval, 60);
         assert_eq!(config.average_bit_rate_bps, Some(30_000_000));
+        // Record-only 4K encodes for quality, not for a live leg's deadline.
+        assert!(!config.low_latency);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
     fn videotoolbox_config_maps_4k60_recording_profile_to_two_second_keyframes() {
-        let config =
-            VideoToolboxBridgeEncoderConfig::from_recording_profile(3840, 2160, 60, Some(50_000));
+        let config = VideoToolboxBridgeEncoderConfig::from_recording_profile(
+            3840,
+            2160,
+            60,
+            Some(50_000),
+            true,
+        );
 
         assert_eq!(config.expected_frame_rate, 60);
         assert_eq!(config.max_key_frame_interval, 120);
         assert_eq!(config.average_bit_rate_bps, Some(50_000_000));
+        assert!(config.low_latency);
     }
 
     #[test]

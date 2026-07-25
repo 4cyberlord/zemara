@@ -40,6 +40,16 @@ pub fn list_native_capture_sources() -> NativeCaptureSources {
     macos::list_native_capture_sources()
 }
 
+/// One-shot "ask macOS for Screen Recording permission" entry, used by the
+/// desktop shell's onboarding (via `--request-screen-access`) before the
+/// backend service itself is running. CGRequestScreenCaptureAccess shows the
+/// real system prompt only when the state is not-determined and otherwise
+/// just returns the current access — safe to call repeatedly.
+#[cfg(target_os = "macos")]
+pub fn request_screen_capture_access() -> bool {
+    macos::request_screen_capture_access()
+}
+
 #[cfg(target_os = "windows")]
 pub fn list_native_capture_sources() -> NativeCaptureSources {
     windows_native::list_native_capture_sources()
@@ -382,6 +392,10 @@ mod macos {
 
     fn screen_capture_access_granted() -> bool {
         CGPreflightScreenCaptureAccess() || CGRequestScreenCaptureAccess()
+    }
+
+    pub fn request_screen_capture_access() -> bool {
+        CGRequestScreenCaptureAccess()
     }
 
     fn screen_capture_permission_message() -> String {

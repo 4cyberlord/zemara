@@ -9,8 +9,8 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use anyhow::{Result, bail};
-use serde::Serialize;
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, mpsc, watch};
 
 use crate::audio::AudioFrame;
@@ -19,6 +19,9 @@ use crate::state::AppState;
 use crate::videorc_api::{
     CAPTION_CHUNK_UPLOAD_TIMEOUT, CaptionChunkFailure, CaptionChunkResponse, VideorcApiClient,
 };
+
+mod deepgram;
+mod local;
 
 pub const CAPTION_SAMPLE_RATE: u32 = 16_000;
 pub const CAPTION_CHUNK_SECONDS: f64 = 3.0;
@@ -1703,6 +1706,42 @@ pub enum CaptionsTransport {
     Chunked,
 }
 
+/// The speech engine that owns a caption session: the signed-in Zemara
+/// gateway (`Cloud`), a bring-your-own-key Deepgram socket (`Deepgram`), or
+/// the bundled on-device model (`Local`) that works with no account at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptionProvider {
+    Local,
+    Deepgram,
+    Cloud,
+}
+
+/// Operator's engine preference: on-device (`Local`) or a network provider
+/// (`Cloud` — Deepgram when a key is configured, otherwise the Zemara
+/// gateway, which requires sign-in).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CaptionProviderPreference {
+    Local,
+    #[default]
+    Cloud,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+pub struct CaptionStartParams {
+    pub language: Option<String>,
+    pub provider: Option<CaptionProviderPreference>,
+    pub deepgram_api_key: Option<String>,
+    /// Preferred native microphone (`microphone:coreaudio:<id>`) for the
+    /// standalone listening session; falls back to the first available mic.
+    pub microphone_id: Option<String>,
+    /// Pewbeam-style standalone listening: run the mic session even when no
+    /// capture is active, so Bible Verse detection works outside recordings.
+    pub allow_idle_session: Option<bool>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CaptionAudioSource {
@@ -1716,6 +1755,10 @@ pub struct CaptionsStatus {
     pub desired_enabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transport: Option<CaptionsTransport>,
+    /// The engine this status belongs to — lets the UI say "on-device" vs
+    /// "Deepgram" vs gateway instead of hiding the distinction.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<CaptionProvider>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_source: Option<CaptionAudioSource>,
     pub audio_frames_seen: u64,
@@ -1738,6 +1781,7 @@ impl CaptionsStatus {
             state: CaptionsState::Idle,
             desired_enabled: false,
             transport: None,
+            provider: None,
             audio_source: None,
             audio_frames_seen: 0,
             dropped_audio_frames: 0,
@@ -1755,6 +1799,7 @@ impl CaptionsStatus {
             state: CaptionsState::Ready,
             desired_enabled: true,
             transport: None,
+            provider: None,
             audio_source: Some(CaptionAudioSource::Microphone),
             audio_frames_seen: 0,
             dropped_audio_frames: 0,
@@ -1772,6 +1817,7 @@ impl CaptionsStatus {
             state,
             desired_enabled: true,
             transport: Some(transport),
+            provider: None,
             audio_source: Some(CaptionAudioSource::Microphone),
             audio_frames_seen: TAP_FRAMES_SEEN.load(Ordering::Relaxed),
             dropped_audio_frames: TAP_FRAMES_DROPPED.load(Ordering::Relaxed),
@@ -1827,12 +1873,75 @@ pub struct CaptionContractTestCue {
     pub capture_epoch: u64,
 }
 
+/// Standalone microphone capture that feeds the caption bus while a
+/// pewbeam-style idle session (no recording/streaming active) is listening.
+/// The recording writer offers post-gain/post-mute frames onto this same bus,
+/// so the pump below reproduces exactly that feed for idle sessions: engines
+/// cannot tell whether audio came from a capture or the live mic.
+struct IdleCaptionMicrophone {
+    source: Option<crate::audio::NativeAudioSource>,
+    pump: Option<std::thread::JoinHandle<()>>,
+}
+
+impl IdleCaptionMicrophone {
+    fn start(microphone_id: Option<&str>) -> Result<Self> {
+        let device_id = match microphone_id.and_then(crate::audio::parse_coreaudio_microphone_id) {
+            Some(device_id) => device_id,
+            None => crate::audio::list_native_microphones()
+                .into_iter()
+                .find(|device| device.status == crate::protocol::DeviceStatus::Available)
+                .and_then(|device| crate::audio::parse_coreaudio_microphone_id(&device.id))
+                .context("No native microphone is available for live captions on this device.")?,
+        };
+        // Standalone listening uses the natural voice: no gain staging and no
+        // mute — the operator's own mic toggle is the privacy boundary.
+        let settings = crate::audio::AudioProcessingSettings {
+            gain_db: 0.0,
+            muted: false,
+        };
+        let mut source = crate::audio::start_native_audio_source(device_id, settings)
+            .context("Live captions could not open the microphone")?;
+        let receiver = source
+            .take_frame_receiver()
+            .context("The live-caption microphone produced no audio channel.")?;
+        let pump = std::thread::Builder::new()
+            .name("caption-idle-mic".to_string())
+            .spawn(move || {
+                while let Ok(frame) = receiver.recv() {
+                    offer_caption_frame(&frame);
+                }
+            })
+            .context("Could not start the live-caption microphone pump")?;
+        Ok(Self {
+            source: Some(source),
+            pump: Some(pump),
+        })
+    }
+}
+
+impl Drop for IdleCaptionMicrophone {
+    fn drop(&mut self) {
+        // Dropping the source stops CoreAudio and disconnects the pump's
+        // channel, so the join is bounded by device-stop latency, not speech.
+        self.source.take();
+        if let Some(pump) = self.pump.take() {
+            let _ = pump.join();
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct CaptionsCoordinator {
     task: Option<tokio::task::JoinHandle<()>>,
     stop: Option<Arc<AtomicBool>>,
     status: Option<CaptionsStatus>,
     desired_enabled: bool,
+    /// Engine of the current/last requested session — stamped onto every
+    /// status so the UI can distinguish on-device from network providers.
+    provider: Option<CaptionProvider>,
+    /// Standalone mic feeding the caption bus while an idle (no-capture)
+    /// session listens. None during recordings — the writer feeds the bus.
+    idle_mic: Option<IdleCaptionMicrophone>,
     language: Option<String>,
     /// Transcribed chunks awaiting the post-recording pass (drained +
     /// epoch-filtered at session stop).
@@ -2173,13 +2282,13 @@ pub async fn caption_sign_out_test_snapshot(state: &AppState) -> CaptionSignOutT
 }
 
 pub async fn captions_status(state: &AppState) -> CaptionsStatus {
-    let mut status = state
-        .captions
-        .lock()
-        .await
+    let coordinator = state.captions.lock().await;
+    let mut status = coordinator
         .status
         .clone()
         .unwrap_or_else(CaptionsStatus::idle);
+    status.provider = coordinator.provider;
+    drop(coordinator);
     if matches!(
         status.state,
         CaptionsState::Starting
@@ -2224,6 +2333,8 @@ pub async fn caption_contract_test_snapshot(
 }
 
 fn set_status(state: &AppState, coordinator: &mut CaptionsCoordinator, status: CaptionsStatus) {
+    let mut status = status;
+    status.provider = coordinator.provider;
     coordinator.status = Some(status.clone());
     state.emit_event("captions.status", status);
 }
@@ -2232,30 +2343,61 @@ fn set_status(state: &AppState, coordinator: &mut CaptionsCoordinator, status: C
 /// hold the coordinator lock while the RPC handler might).
 async fn publish_status(state: &AppState, status: CaptionsStatus) {
     let mut coordinator = state.captions.lock().await;
+    let mut status = status;
+    status.provider = coordinator.provider;
     coordinator.status = Some(status.clone());
     drop(coordinator);
     state.emit_event("captions.status", status);
 }
 
-pub async fn start_captions(state: &AppState, language: Option<String>) -> Result<CaptionsStatus> {
+pub async fn start_captions(
+    state: &AppState,
+    params: CaptionStartParams,
+) -> Result<CaptionsStatus> {
     let _control = CAPTION_CONTROL.lock().await;
-    let Some(bearer) = crate::account::stored_session_token() else {
-        bail!("Sign in to use live captions.");
+    // Engine resolution: explicit on-device preference needs no credential at
+    // all; a configured Deepgram key uses that socket; otherwise the Zemara
+    // gateway, which is the only path that still requires sign-in.
+    let preference = params.provider.unwrap_or_default();
+    let deepgram_key = params
+        .deepgram_api_key
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty());
+    let engine = match preference {
+        CaptionProviderPreference::Local => CaptionProvider::Local,
+        CaptionProviderPreference::Cloud if deepgram_key.is_some() => CaptionProvider::Deepgram,
+        CaptionProviderPreference::Cloud => CaptionProvider::Cloud,
+    };
+    let bearer = match engine {
+        CaptionProvider::Cloud => {
+            let Some(token) = crate::account::stored_session_token() else {
+                bail!(
+                    "Sign in to use live captions, add a Deepgram API key, or switch the speech engine to on-device."
+                );
+            };
+            token
+        }
+        CaptionProvider::Deepgram => deepgram_key.unwrap_or_default(),
+        CaptionProvider::Local => String::new(),
     };
     let client = VideorcApiClient::new()?;
-    let language = normalize_caption_language(language);
+    let language = normalize_caption_language(params.language);
     let capture_elapsed_seconds = crate::recording::active_capture_elapsed_seconds(state).await;
+    let recording_active = capture_elapsed_seconds.is_some();
+    let idle_contract_test = caption_contract_idle_session_enabled();
     let capture_active =
-        capture_elapsed_seconds.is_some() || caption_contract_idle_session_enabled();
+        recording_active || params.allow_idle_session.unwrap_or(false) || idle_contract_test;
 
     let mut coordinator = state.captions.lock().await;
     coordinator.desired_enabled = true;
     coordinator.language = language.clone();
+    coordinator.provider = Some(engine);
     if !capture_active {
         if let Some(task) = coordinator.task.take() {
             task.abort();
         }
         coordinator.stop = None;
+        coordinator.idle_mic = None;
         remove_tap();
         let status = CaptionsStatus::ready();
         set_status(state, &mut coordinator, status.clone());
@@ -2276,23 +2418,55 @@ pub async fn start_captions(state: &AppState, language: Option<String>) -> Resul
     if let Some(task) = coordinator.task.take() {
         task.abort();
     }
+    // A recording feeds the caption bus from its own writer; only a standalone
+    // session needs the microphone opened here. Drop any previous idle feed so
+    // the new bus sees exactly one audio source.
+    coordinator.idle_mic = None;
     remove_tap();
 
     let session_client_id = format!("captions-{}", uuid::Uuid::new_v4().simple());
     let sequence = coordinator.sequence.clone();
     let stop = Arc::new(AtomicBool::new(false));
     let receiver = install_tap();
+    if !recording_active && !idle_contract_test {
+        match IdleCaptionMicrophone::start(params.microphone_id.as_deref()) {
+            Ok(mic) => {
+                coordinator.idle_mic = Some(mic);
+            }
+            Err(error) => {
+                remove_tap();
+                let message = format!("{error:#}");
+                let mut status = CaptionsStatus::active(
+                    CaptionsState::Blocked,
+                    CaptionsTransport::Realtime,
+                    &session_client_id,
+                );
+                status.reason_code = Some("audio-path-unavailable".to_string());
+                status.message = Some(message.clone());
+                set_status(state, &mut coordinator, status.clone());
+                bail!(message);
+            }
+        }
+    }
     let mut status = CaptionsStatus::active(
         CaptionsState::Starting,
         CaptionsTransport::Realtime,
         &session_client_id,
     );
-    status.message = Some("Connecting live captions…".to_string());
+    status.message = Some(
+        match engine {
+            CaptionProvider::Local => "Loading the on-device speech model…",
+            CaptionProvider::Deepgram => "Connecting Deepgram live captions…",
+            CaptionProvider::Cloud => "Connecting live captions…",
+        }
+        .to_string(),
+    );
     set_status(state, &mut coordinator, status.clone());
 
     let task_state = state.clone();
     let task_stop = stop.clone();
     coordinator.task = Some(tokio::spawn(run_caption_session(CaptionSession {
+        engine,
         bearer,
         client,
         language,
@@ -2318,6 +2492,7 @@ pub async fn stop_captions(state: &AppState) -> CaptionsStatus {
         let mut coordinator = state.captions.lock().await;
         coordinator.desired_enabled = false;
         coordinator.language = None;
+        coordinator.idle_mic = None;
         remove_tap();
         let status = CaptionsStatus::idle();
         coordinator.status = Some(status.clone());
@@ -2343,6 +2518,7 @@ pub async fn stop_captions_for_sign_out(
         coordinator.desired_enabled = false;
         coordinator.language = None;
         coordinator.chunks.clear();
+        coordinator.idle_mic = None;
         coordinator.capture_epoch = coordinator.capture_epoch.saturating_add(1);
         coordinator.finalized_style = None;
         coordinator.artifact_generation = coordinator.artifact_generation.saturating_add(1);
@@ -2440,6 +2616,9 @@ async fn finish_caption_task(
         if !preserve_desired {
             coordinator.desired_enabled = false;
         }
+        // The standalone mic belongs to the session being torn down — a new
+        // session (or a recording's own audio bus) opens its own feed.
+        coordinator.idle_mic = None;
         (coordinator.task.take(), coordinator.stop.take())
     };
     if !drain_final_transcript && let Some(stop) = stop.as_ref() {
@@ -2516,6 +2695,9 @@ fn normalize_caption_language(language: Option<String>) -> Option<String> {
 }
 
 struct CaptionSession {
+    engine: CaptionProvider,
+    /// Gateway token for `Cloud`, the operator's own key for `Deepgram`,
+    /// empty for `Local` — the credential each engine actually needs.
     bearer: String,
     client: VideorcApiClient,
     language: Option<String>,
@@ -2932,28 +3114,9 @@ async fn run_caption_session(mut session: CaptionSession) {
     let sequence = session.sequence.clone();
     let mut timeline = CaptionTimeline::new(session.capture_elapsed_seconds);
     let mut audio_heartbeat = CaptionAudioHeartbeat::new(std::time::Instant::now());
-    let ended_normally = match run_realtime_caption_session(
-        &mut session,
-        &sequence,
-        &mut timeline,
-        &mut audio_heartbeat,
-    )
-    .await
-    {
-        RealtimeOutcome::Ended => true,
-        RealtimeOutcome::Fallback(reason) => {
-            tracing::info!(
-                "Streaming captions unavailable ({reason}); using chunked transcription."
-            );
-            let mut status = CaptionsStatus::active(
-                CaptionsState::Degraded,
-                CaptionsTransport::Chunked,
-                &session.session_client_id,
-            );
-            status.reason_code = Some("realtime-fallback".to_string());
-            status.message = Some(format!("Captions on with higher delay — {reason}"));
-            publish_status(&session.state, status).await;
-            run_chunked_caption_session(
+    let ended_normally = match session.engine {
+        CaptionProvider::Local => {
+            local::run_local_caption_session(
                 &mut session,
                 &sequence,
                 &mut timeline,
@@ -2961,11 +3124,55 @@ async fn run_caption_session(mut session: CaptionSession) {
             )
             .await
         }
-        RealtimeOutcome::Terminal => false,
+        CaptionProvider::Deepgram => {
+            deepgram::run_deepgram_caption_session(
+                &mut session,
+                &sequence,
+                &mut timeline,
+                &mut audio_heartbeat,
+            )
+            .await
+        }
+        CaptionProvider::Cloud => {
+            match run_realtime_caption_session(
+                &mut session,
+                &sequence,
+                &mut timeline,
+                &mut audio_heartbeat,
+            )
+            .await
+            {
+                RealtimeOutcome::Ended => true,
+                RealtimeOutcome::Fallback(reason) => {
+                    tracing::info!(
+                        "Streaming captions unavailable ({reason}); using chunked transcription."
+                    );
+                    let mut status = CaptionsStatus::active(
+                        CaptionsState::Degraded,
+                        CaptionsTransport::Chunked,
+                        &session.session_client_id,
+                    );
+                    status.reason_code = Some("realtime-fallback".to_string());
+                    status.message = Some(format!("Captions on with higher delay — {reason}"));
+                    publish_status(&session.state, status).await;
+                    run_chunked_caption_session(
+                        &mut session,
+                        &sequence,
+                        &mut timeline,
+                        &mut audio_heartbeat,
+                    )
+                    .await
+                }
+                RealtimeOutcome::Terminal => false,
+            }
+        }
     };
     if ended_normally {
         remove_tap();
-        let desired_enabled = session.state.captions.lock().await.desired_enabled;
+        let mut coordinator = session.state.captions.lock().await;
+        coordinator.idle_mic = None;
+        let desired_enabled = coordinator.desired_enabled;
+        drop(coordinator);
         publish_status(
             &session.state,
             if desired_enabled {
@@ -3523,6 +3730,7 @@ async fn publish_blocked_status(
 
 async fn publish_blocked_presentation(state: &AppState, status: CaptionsStatus) {
     let mut coordinator = state.captions.lock().await;
+    coordinator.idle_mic = None;
     coordinator.status = Some(status.clone());
     drop(coordinator);
     publish_caption_boundary(state, &status, "blocked");

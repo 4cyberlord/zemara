@@ -629,7 +629,10 @@ export function VideosTab(): ReactElement {
                         }
                         options={[
                           { value: NO_CATEGORY, label: 'No category' },
-                          ...videoCategories.map((entry) => ({ value: entry.id, label: entry.name }))
+                          ...videoCategories.map((entry) => ({
+                            value: entry.id,
+                            label: entry.name
+                          }))
                         ]}
                       />
                     </Field>

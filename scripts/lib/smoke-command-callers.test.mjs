@@ -20,6 +20,10 @@ test('every direct smoke command HTTP caller sends the per-run bearer capability
 
   for (const path of scriptFiles()) {
     const source = readFileSync(path, 'utf8')
+    // Only files that touch the smoke harness can be smoke command callers.
+    // Dev scripts hitting an unrelated server's "/health" (e.g. the admin
+    // backend bootstrap in dev-with-admin-backend.mjs) must not trip this.
+    if (!/smoke/i.test(source)) continue
     for (const match of source.matchAll(/\/command\b|\/health\b|\/preview-frame\.png\b/g)) {
       const requestWindow = source.slice(match.index, match.index + 800)
       if (!/Bearer \$\{(?:smoke|conn\.smoke)\.capability\}|Bearer \$\{C\}/.test(requestWindow)) {
@@ -103,6 +107,7 @@ test('the Electron server is loopback-only and packaged mode requires a harness 
   assert.match(packagedPreviewSmoke, /usePackagedWindowsScreen/)
   assert.match(packagedPreviewSmoke, /VIDEORC_DISABLE_AUTO_SOURCE_PREVIEW: '1'/)
   assert.match(packagedPreviewSmoke, /nativeWindowsScreenCandidates/)
+  assert.match(packagedPreviewSmoke, /'scene\.layout\.apply_preview'/)
   assert.match(packagedPreviewSmoke, /exerciseProofFramePolling && !packagedSpawnSpec/)
   assert.match(packagedPreviewSmoke, /expectAudio: !usePackagedWindowsScreen/)
   assert.match(packagedPreviewSmoke, /'preview\.screen\.start'/)

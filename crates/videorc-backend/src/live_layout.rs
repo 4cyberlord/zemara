@@ -1582,65 +1582,50 @@ mod tests {
         .await
         .expect("first layout intent should register");
 
-        // Hold the runtime slot so retirement reaches the detach edge but cannot
-        // complete it. A newer intent must remain blocked until that edge finishes;
-        // otherwise it can register between the old check and the old stop.
-        let screen = state.preview_screen.lock().await;
-        let retirement_state = state.clone();
-        let retirement = tokio::spawn(async move {
-            retire_unused_sources_after_commit(
-                &retirement_state,
-                intent_id,
-                SceneSourceNeeds {
-                    camera: true,
-                    screen: false,
-                },
-            )
-            .await;
-        });
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        // Retirement is deferred: the unused screen source stays warm behind
+        // UNUSED_SOURCE_STOP_GRACE in a detached task, so this returns promptly
+        // without holding the intent guard and newer intents are never blocked.
+        retire_unused_sources_after_commit(
+            &state,
+            intent_id,
+            SceneSourceNeeds {
+                camera: true,
+                screen: false,
+            },
+        )
+        .await;
 
         assert!(
-            state.layout_intents.try_lock().is_err(),
-            "retirement released the intent guard before detaching the screen source"
+            state.layout_intents.try_lock().is_ok(),
+            "deferred retirement must not hold the intent guard"
         );
 
-        let winner_state = state.clone();
-        let winner = tokio::spawn(async move {
-            let intent_id = begin_layout_intent(
-                &winner_state,
-                Some(2),
-                SceneSourceNeeds {
-                    camera: false,
-                    screen: true,
-                },
-            )
-            .await
-            .expect("newer screen intent should register after retirement detaches");
-            let target = sources(false, true);
-            winner_state.preview_screen.lock().await.status = live_screen_status(
-                target.screen_id.as_deref().expect("selected screen"),
-                Some(0),
-                1,
-                Some(1),
-            );
-            (intent_id, target)
-        });
-        tokio::task::yield_now().await;
-        assert!(
-            !winner.is_finished(),
-            "newer screen intent registered before old retirement detached"
+        // The winner registers immediately instead of waiting for a detach edge.
+        // When the grace task eventually fires it re-reads the latest intent,
+        // sees the winner still needs the screen, and leaves it running.
+        let winner_id = begin_layout_intent(
+            &state,
+            Some(2),
+            SceneSourceNeeds {
+                camera: false,
+                screen: true,
+            },
+        )
+        .await
+        .expect("newer screen intent registers immediately; retirement is deferred");
+        let target = sources(false, true);
+        state.preview_screen.lock().await.status = live_screen_status(
+            target.screen_id.as_deref().expect("selected screen"),
+            Some(0),
+            1,
+            Some(1),
         );
-
-        drop(screen);
-        retirement.await.expect("screen retirement task");
-        let (winner_id, winner_target) = winner.await.expect("newer screen intent task");
 
         let intents = state.layout_intents.lock().await;
         assert_eq!(intents.latest_intent_id, winner_id);
         assert!(intents.latest_needs_screen);
         drop(intents);
-        assert!(source_liveness(&state, &winner_target).await.screen);
+        assert!(source_liveness(&state, &target).await.screen);
     }
 
     #[tokio::test]

@@ -10,7 +10,7 @@ import type {
   RuntimeInfo,
   SystemPermissionPane
 } from '@/lib/backend'
-import { systemAccessAction, systemAccessRows } from '@/lib/system-access'
+import { mediaAccessToState, systemAccessAction, systemAccessRows } from '@/lib/system-access'
 
 type SystemPermissionOrchestration = {
   pane: SystemPermissionPane
@@ -121,11 +121,19 @@ export async function runSystemPermissionAction({
     platform,
     mediaAccess: snapshot
   }).find((candidate) => candidate.id === pane)
+  // Screen Recording has no device/meter evidence the way camera/mic do —
+  // the honest state is the main-process TCC read (which also owns the
+  // never-asked vs denied distinction Electron cannot make).
+  const screenAccessStatus =
+    pane === 'screen-recording' ? await window.videorc?.getScreenAccessStatus?.() : undefined
   const mediaAccessStatus =
-    pane === 'camera' || pane === 'microphone' ? snapshot?.[pane] : undefined
+    pane === 'camera' || pane === 'microphone' ? snapshot?.[pane] : screenAccessStatus
   const action = systemAccessAction({
     pane,
-    state: row?.state,
+    state:
+      pane === 'screen-recording' && screenAccessStatus
+        ? mediaAccessToState(screenAccessStatus)
+        : row?.state,
     platform,
     mediaAccessStatus
   })
@@ -138,6 +146,19 @@ export async function runSystemPermissionAction({
       clearMicrophoneEvidence()
     }
     await openSystemPermissionSettings(pane)
+    return
+  }
+
+  if (pane === 'screen-recording') {
+    const requestScreenAccess = window.videorc?.requestScreenAccess
+    if (!requestScreenAccess) {
+      toast.error('Permission request is unavailable outside Electron.')
+      return
+    }
+    // Triggers the real macOS prompt on first use; when the prompt alone
+    // cannot finish the job the main process lands the operator on the
+    // Screen Recording pane itself.
+    await requestScreenAccess()
     return
   }
 

@@ -39,6 +39,9 @@ describe('renderer security policy', () => {
       'comments'
     )
     expect(
+      rendererRoleFromArguments(['electron', '--videorc-renderer-role=livingTextOutput'])
+    ).toBe('livingTextOutput')
+    expect(
       rendererRoleFromArguments([
         '--videorc-renderer-role=main',
         '--videorc-renderer-role=comments'

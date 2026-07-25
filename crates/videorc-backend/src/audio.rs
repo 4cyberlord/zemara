@@ -383,6 +383,13 @@ impl NativeAudioSource {
     pub fn stats_handle(&self) -> Arc<AudioCaptureStats> {
         self.stats.clone()
     }
+
+    /// Take the processed-frame channel for a non-recording consumer (the
+    /// standalone live-caption microphone pump). Recording keeps using the
+    /// FIFO writer path, which takes this same receiver at session start.
+    pub fn take_frame_receiver(&mut self) -> Option<mpsc::Receiver<AudioFrame>> {
+        self.receiver.take()
+    }
 }
 
 impl std::fmt::Debug for NativeAudioSource {

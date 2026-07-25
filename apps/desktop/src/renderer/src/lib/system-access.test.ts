@@ -380,6 +380,29 @@ describe('systemAccessAction', () => {
     ).toBe('request-media-access')
   })
 
+  it('requests native macOS screen recording access only on a true first use', () => {
+    expect(
+      systemAccessAction({
+        pane: 'screen-recording',
+        state: 'first-use',
+        platform: 'darwin',
+        mediaAccessStatus: 'not-determined'
+      })
+    ).toBe('request-media-access')
+    // Asked before (or status unknown) → macOS cannot re-prompt: settings.
+    expect(
+      systemAccessAction({
+        pane: 'screen-recording',
+        state: 'not-granted',
+        platform: 'darwin',
+        mediaAccessStatus: 'denied'
+      })
+    ).toBe('open-settings')
+    expect(
+      systemAccessAction({ pane: 'screen-recording', state: 'granted', platform: 'darwin' })
+    ).toBeNull()
+  })
+
   it('opens settings for denied media, screen recording, privacy, and Windows', () => {
     expect(systemAccessAction({ pane: 'camera', state: 'not-granted', platform: 'darwin' })).toBe(
       'open-settings'

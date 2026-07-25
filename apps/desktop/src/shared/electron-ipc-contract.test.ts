@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs'
 
 import { describe, expect, expectTypeOf, it } from 'vitest'
 
-import type { BackendConnection, VideorcApi } from './backend'
+import type { BackendConnection, LivingTextOutputTheme, VideorcApi } from './backend'
 import {
   MAX_NOTES_TEXT_LENGTH,
   boundedPassthroughElectronEventChannels,
@@ -26,8 +26,8 @@ import {
 describe('Electron IPC contract', () => {
   it('maps every renderer-facing invoke channel to a real async API method', () => {
     expectTypeOf<ElectronInvokeMappingInvariant>().toEqualTypeOf<true>()
-    expect(Object.keys(electronInvokeApiMethods)).toHaveLength(101)
-    expect(new Set(Object.values(electronInvokeApiMethods)).size).toBe(101)
+    expect(Object.keys(electronInvokeApiMethods)).toHaveLength(104)
+    expect(new Set(Object.values(electronInvokeApiMethods)).size).toBe(104)
     expectTypeOf<ElectronInvokeArgs<'resource:trash-session-deletion'>>().toEqualTypeOf<
       Parameters<VideorcApi['trashSessionDeletion']>
     >()
@@ -66,6 +66,54 @@ describe('Electron IPC contract', () => {
     expect(() => validateElectronInvokeArgs('shell:exec', ['calc.exe'])).toThrow(
       'Electron IPC channel is not declared'
     )
+  })
+
+  it('accepts the full LivingTextOutputTheme mirror on output pushes', () => {
+    // The IPC schema mirrors every LivingTextOutputTheme field; a typed
+    // literal keeps this object complete at compile time when the theme
+    // grows, and the schema check proves the mirror accepts it at runtime.
+    const theme: LivingTextOutputTheme = {
+      backgroundType: 'gradient',
+      backgroundColor: '#000000',
+      gradientAngle: 135,
+      gradientColorStart: '#0f0c29',
+      gradientColorEnd: '#302b63',
+      backgroundImagePath: null,
+      backgroundImageOpacity: 0.5,
+      textColor: '#ffffff',
+      fontSize: 56,
+      fontFamily: 'system-ui, -apple-system, sans-serif',
+      fontWeight: 600,
+      lineHeight: 1.35,
+      letterSpacing: 0,
+      textAlign: 'center',
+      textShadowBlur: 0,
+      textShadowX: 0,
+      textShadowY: 2,
+      textShadowColor: 'rgba(0,0,0,0.6)',
+      textStrokeWidth: 0,
+      textStrokeColor: '#000000',
+      referenceColor: '#f5c451',
+      referenceAlign: 'center',
+      referenceFontSize: 0,
+      verticalPosition: 'center',
+      horizontalPaddingPct: 8,
+      maxWidthPct: 80,
+      displayMode: 'fullscreen',
+      resolutionWidth: 1920,
+      resolutionHeight: 1080
+    }
+    const payload = {
+      theme,
+      verse: { text: 'For God so loved the world…', reference: 'John 3:16' }
+    }
+    expect(validateElectronInvokeArgs('livingText-output:push', [payload])).toHaveLength(1)
+    expect(validateElectronEventPayload('livingText-output:update', payload)).toEqual(payload)
+    expect(() =>
+      validateElectronInvokeArgs('livingText-output:push', [
+        { ...payload, theme: { ...theme, unexpectedField: true } }
+      ])
+    ).toThrow('known field')
   })
 
   it('validates account authorization URLs and callback identifiers', () => {

@@ -484,6 +484,7 @@ pub async fn import_recording(
             stream_enabled: false,
             output_directory: Some(output_directory.trim().to_string()),
             ffmpeg_path: None,
+            keep_original_mkv: false,
             video: crate::protocol::VideoSettings {
                 preset: crate::protocol::VideoPreset::Tutorial1080p30,
                 width: 1920,
@@ -538,7 +539,29 @@ mod tests {
             let script = format!(
                 "[System.IO.File]::WriteAllText('{escaped_pid_file}', [string]$PID); Start-Sleep -Seconds 30"
             );
-            let mut command = tokio::process::Command::new("powershell.exe");
+            let powershell = std::env::var("SystemRoot")
+                .ok()
+                .map(|root| {
+                    std::path::Path::new(&root)
+                        .join("System32")
+                        .join("WindowsPowerShell")
+                        .join("v1.0")
+                        .join("powershell.exe")
+                })
+                .filter(|path| path.is_file())
+                .or_else(|| {
+                    std::env::var("ProgramFiles")
+                        .ok()
+                        .map(|root| {
+                            std::path::Path::new(&root)
+                                .join("PowerShell")
+                                .join("7")
+                                .join("pwsh.exe")
+                        })
+                        .filter(|path| path.is_file())
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from("pwsh.exe"));
+            let mut command = tokio::process::Command::new(powershell);
             command.args(["-NoProfile", "-NonInteractive", "-Command", &script]);
             command
         }
@@ -570,11 +593,17 @@ mod tests {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
 
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            output_duration_probe(&mut command),
-        )
-        .await;
+        // Windows runners can take more than a second to cold-start
+        // powershell.exe before the script writes its PID. Keep the command's
+        // 30-second sleep as the behavior under test while allowing startup
+        // enough time that a slow host does not turn this lifecycle assertion
+        // into a PID-file race.
+        let probe_timeout = if cfg!(target_os = "windows") {
+            std::time::Duration::from_secs(5)
+        } else {
+            std::time::Duration::from_secs(1)
+        };
+        let result = tokio::time::timeout(probe_timeout, output_duration_probe(&mut command)).await;
         assert!(result.is_err(), "probe child should exceed the timeout");
 
         let pid = std::fs::read_to_string(&pid_file)

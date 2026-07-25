@@ -30,17 +30,26 @@ export function AdminDatabaseSection(): ReactElement {
 }
 
 function AdminDatabaseSectionView({ admin }: { admin: UseAdminBackend }): ReactElement {
-  const { connection, connectionLoading, connectionError, saveConnection, clearConnection, testConnection } =
-    admin
+  const {
+    connection,
+    connectionLoading,
+    connectionError,
+    saveConnection,
+    clearConnection,
+    testConnection
+  } = admin
 
   const [baseUrlDraft, setBaseUrlDraft] = useState('')
   const [apiKeyDraft, setApiKeyDraft] = useState('')
   const [savePending, setSavePending] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [testPending, setTestPending] = useState(false)
-  const [testResult, setTestResult] = useState<
-    { reachable: boolean; databaseOk: boolean; authOk: boolean; message: string } | null
-  >(null)
+  const [testResult, setTestResult] = useState<{
+    reachable: boolean
+    databaseOk: boolean
+    authOk: boolean
+    message: string
+  } | null>(null)
   const [registerOpen, setRegisterOpen] = useState(false)
 
   // Seed the draft from the stored connection once it loads — but only once,
@@ -78,7 +87,9 @@ function AdminDatabaseSectionView({ admin }: { admin: UseAdminBackend }): ReactE
         setApiKeyDraft('')
         setTestResult(null)
       })
-      .catch((error: unknown) => setSaveError(error instanceof Error ? error.message : String(error)))
+      .catch((error: unknown) =>
+        setSaveError(error instanceof Error ? error.message : String(error))
+      )
       .finally(() => setSavePending(false))
   }
 
@@ -115,7 +126,9 @@ function AdminDatabaseSectionView({ admin }: { admin: UseAdminBackend }): ReactE
             id="admin-api-key"
             type="password"
             placeholder={
-              connection?.apiKeyConfigured ? `Stored (ends ${connection.apiKeyHint})` : 'Paste your API key'
+              connection?.apiKeyConfigured
+                ? `Stored (ends ${connection.apiKeyHint})`
+                : 'Paste your API key'
             }
             value={apiKeyDraft}
             onChange={(event) => setApiKeyDraft(event.target.value)}
@@ -233,7 +246,13 @@ function RegisterOrganizationDialog({
     setPending(true)
     setError(null)
     void admin
-      .registerOrganization(baseUrl, organizationName.trim(), ownerName.trim(), ownerEmail.trim(), ownerPassword)
+      .registerOrganization(
+        baseUrl,
+        organizationName.trim(),
+        ownerName.trim(),
+        ownerEmail.trim(),
+        ownerPassword
+      )
       .then(() => onClose())
       .catch((submitError: unknown) =>
         setError(submitError instanceof Error ? submitError.message : String(submitError))
@@ -246,8 +265,9 @@ function RegisterOrganizationDialog({
       <DialogHeader>
         <DialogTitle>Create a new church workspace</DialogTitle>
         <DialogDescription>
-          This sets up a brand-new, fully separate workspace on {baseUrl || 'your admin API'} — its own church
-          record, owner account, and API key. Existing churches on the same server are unaffected.
+          This sets up a brand-new, fully separate workspace on {baseUrl || 'your admin API'} — its
+          own church record, owner account, and API key. Existing churches on the same server are
+          unaffected.
         </DialogDescription>
       </DialogHeader>
 

@@ -130,7 +130,6 @@ export function QuickSettings(): ReactElement {
     entitlements,
     captionsStatus,
     captionsCommandPending,
-    mediaAccess,
     wsStatus
   } = useStudioCore()
   // Q6 (plan 022): before the backend reports devices, selects say "Finding
@@ -139,6 +138,9 @@ export function QuickSettings(): ReactElement {
   const { openStudioPanel } = useWorkspaceNav()
   const captionsGate = cloudAiUploadGate(entitlements)
   const captionsEnabled = captureConfig.captions.enabled
+  // The on-device speech engine needs no account — the premium gate only
+  // applies to network providers.
+  const captionsGateAllowed = captionsGate.allowed || captureConfig.captions.provider === 'local'
 
   const captureDevices = capturePickerDevices(deviceList.devices)
   const cameras = deviceList.devices.filter((device) => device.kind === 'camera')
@@ -240,14 +242,10 @@ export function QuickSettings(): ReactElement {
                 }))
               }
             />
-            {/* See-before-you-pick: live waveform of the selected mic while the
-                popover is open. Mounted only with the popover, so the preview
-                stream releases the device on close. */}
+            {/* See-before-you-pick: while mounted, this paints snapshots from
+                the workspace's single shared visual-mic pipeline. */}
             <Suspense fallback={<div className="h-[38px] rounded-row border bg-muted/20" />}>
-              <MicPickerPreview
-                deviceName={selectedMicrophone?.name}
-                permissionStatus={mediaAccess?.microphone}
-              />
+              <MicPickerPreview deviceName={selectedMicrophone?.name} />
             </Suspense>
             {selectedMicrophone ? (
               <Button
@@ -348,13 +346,13 @@ export function QuickSettings(): ReactElement {
               captionsStatus,
               captionsEnabled,
               isSessionActive,
-              captionsGate.allowed
+              captionsGateAllowed
             )}
           </span>
           <Switch
             aria-label="Enable live captions"
             checked={captionsEnabled}
-            disabled={captionsCommandPending || (!captionsEnabled && !captionsGate.allowed)}
+            disabled={captionsCommandPending || (!captionsEnabled && !captionsGateAllowed)}
             onCheckedChange={(enabled) =>
               setCaptureConfig((current) => ({
                 ...current,

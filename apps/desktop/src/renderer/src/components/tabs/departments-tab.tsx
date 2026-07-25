@@ -62,8 +62,18 @@ function initials(name: string): string {
   return ((parts[0]?.[0] ?? '') + (parts[1]?.[0] ?? '')).toUpperCase() || '?'
 }
 
-type UnitFormState = { name: string; type: OrganizationalUnitType; description: string; parentUnitId: string }
-const EMPTY_FORM: UnitFormState = { name: '', type: 'department', description: '', parentUnitId: '' }
+type UnitFormState = {
+  name: string
+  type: OrganizationalUnitType
+  description: string
+  parentUnitId: string
+}
+const EMPTY_FORM: UnitFormState = {
+  name: '',
+  type: 'department',
+  description: '',
+  parentUnitId: ''
+}
 
 // Inline member-search picker, shared shape with the Attendance panel's
 // manual-mark search — type-ahead by name, click a result to select it.
@@ -154,7 +164,9 @@ function UnitDetailSheet({
     setLoading(true)
     getUnit(unitId)
       .then(setDetail)
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not load this unit.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not load this unit.')
+      )
       .finally(() => setLoading(false))
   }
 
@@ -174,7 +186,9 @@ function UnitDetailSheet({
         setAddMemberOpen(false)
         refresh()
       })
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not add this member.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not add this member.')
+      )
       .finally(() => setBusy(false))
   }
 
@@ -182,7 +196,9 @@ function UnitDetailSheet({
     if (!unitId) return
     removeUnitMember(unitId, membershipId)
       .then(() => refresh())
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not remove this member.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not remove this member.')
+      )
   }
 
   const handleCreatePosition = (): void => {
@@ -194,7 +210,9 @@ function UnitDetailSheet({
         setAddPositionOpen(false)
         refresh()
       })
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not create this position.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not create this position.')
+      )
       .finally(() => setBusy(false))
   }
 
@@ -202,7 +220,9 @@ function UnitDetailSheet({
     if (!unitId) return
     deleteUnitPosition(unitId, positionId)
       .then(() => refresh())
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not delete this position.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not delete this position.')
+      )
   }
 
   const handleAssign = (positionId: string, member: AdminMember): void => {
@@ -214,7 +234,9 @@ function UnitDetailSheet({
         setAssigningPositionId(null)
         refresh()
       })
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not assign this position.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not assign this position.')
+      )
       .finally(() => setBusy(false))
   }
 
@@ -222,7 +244,9 @@ function UnitDetailSheet({
     if (!unitId) return
     endUnitPositionAssignment(unitId, positionId, assignmentId)
       .then(() => refresh())
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not end this term.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not end this term.')
+      )
   }
 
   const memberIds = new Set((detail?.memberships ?? []).map((membership) => membership.memberId))
@@ -272,14 +296,20 @@ function UnitDetailSheet({
                       value={newPositionName}
                       onChange={(event) => setNewPositionName(event.target.value)}
                     />
-                    <Button size="sm" disabled={busy || !newPositionName.trim()} onClick={handleCreatePosition}>
+                    <Button
+                      size="sm"
+                      disabled={busy || !newPositionName.trim()}
+                      onClick={handleCreatePosition}
+                    >
                       Add
                     </Button>
                   </div>
                 ) : null}
 
                 {(detail.positions ?? []).length === 0 ? (
-                  <p className="py-2 text-center text-xs text-muted-foreground">No positions yet.</p>
+                  <p className="py-2 text-center text-xs text-muted-foreground">
+                    No positions yet.
+                  </p>
                 ) : (
                   <div className="flex flex-col gap-1.5">
                     {(detail.positions ?? []).map((position) => {
@@ -348,14 +378,22 @@ function UnitDetailSheet({
                     <Users className="size-4" />
                     Members ({(detail.memberships ?? []).length})
                   </span>
-                  <Button size="sm" variant="ghost" onClick={() => setAddMemberOpen((current) => !current)}>
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    onClick={() => setAddMemberOpen((current) => !current)}
+                  >
                     <UserPlus className="size-4" />
                     Add member
                   </Button>
                 </div>
 
                 {addMemberOpen ? (
-                  <MemberSearchPicker members={members} excludeIds={memberIds} onPick={handleAddMember} />
+                  <MemberSearchPicker
+                    members={members}
+                    excludeIds={memberIds}
+                    onPick={handleAddMember}
+                  />
                 ) : null}
 
                 {(detail.memberships ?? []).length === 0 ? (
@@ -369,7 +407,9 @@ function UnitDetailSheet({
                       >
                         <Avatar size="sm">
                           <AvatarImage src={membership.member?.avatarUrl ?? undefined} alt="" />
-                          <AvatarFallback>{initials(membership.member?.fullName ?? '?')}</AvatarFallback>
+                          <AvatarFallback>
+                            {initials(membership.member?.fullName ?? '?')}
+                          </AvatarFallback>
                         </Avatar>
                         <div className="min-w-0 flex-1">
                           <p className="truncate text-sm font-medium text-foreground">
@@ -503,7 +543,9 @@ export function DepartmentsTab(): ReactElement {
         toast.success(editing ? 'Unit updated.' : 'Unit created.')
         closeDialog()
       })
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not save this unit.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not save this unit.')
+      )
       .finally(() => setSavePending(false))
   }
 
@@ -511,7 +553,9 @@ export function DepartmentsTab(): ReactElement {
     const nextStatus = unit.status === 'archived' ? 'active' : 'archived'
     updateUnit(unit.id, { status: nextStatus })
       .then(() => toast.success(nextStatus === 'archived' ? 'Unit archived.' : 'Unit restored.'))
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not update this unit.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not update this unit.')
+      )
   }
 
   const topLevel = units.filter((unit) => !unit.parentUnitId)
@@ -545,7 +589,8 @@ export function DepartmentsTab(): ReactElement {
           </EmptyMedia>
           <EmptyTitle>No departments yet</EmptyTitle>
           <EmptyDescription>
-            Create your first department, ministry, or group to start organizing members and leadership.
+            Create your first department, ministry, or group to start organizing members and
+            leadership.
           </EmptyDescription>
           <Button className="mt-2" onClick={openCreate}>
             <Plus className="size-4" />
@@ -582,7 +627,9 @@ export function DepartmentsTab(): ReactElement {
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{editing ? 'Edit unit' : 'New unit'}</DialogTitle>
-            <DialogDescription>Departments, ministries, teams, and groups all live here.</DialogDescription>
+            <DialogDescription>
+              Departments, ministries, teams, and groups all live here.
+            </DialogDescription>
           </DialogHeader>
 
           <FieldGroup>
@@ -591,7 +638,9 @@ export function DepartmentsTab(): ReactElement {
               <Input
                 id="unit-name"
                 value={form.name}
-                onChange={(event) => setForm((current) => ({ ...current, name: event.target.value }))}
+                onChange={(event) =>
+                  setForm((current) => ({ ...current, name: event.target.value }))
+                }
                 placeholder="Music Department"
               />
             </Field>
@@ -614,7 +663,10 @@ export function DepartmentsTab(): ReactElement {
                 className="w-full"
                 value={form.parentUnitId || 'none'}
                 onValueChange={(value) =>
-                  setForm((current) => ({ ...current, parentUnitId: value === 'none' ? '' : value }))
+                  setForm((current) => ({
+                    ...current,
+                    parentUnitId: value === 'none' ? '' : value
+                  }))
                 }
                 options={[
                   { value: 'none', label: 'No parent — top level' },
@@ -657,7 +709,10 @@ export function DepartmentsTab(): ReactElement {
         </DialogContent>
       </Dialog>
 
-      <UnitDetailSheet unitId={manageUnitId} onOpenChange={(open) => !open && setManageUnitId(null)} />
+      <UnitDetailSheet
+        unitId={manageUnitId}
+        onOpenChange={(open) => !open && setManageUnitId(null)}
+      />
     </PageStack>
   )
 }

@@ -19,6 +19,7 @@ mod ffmpeg;
 mod ffmpeg_work;
 mod fifo;
 mod frame_store;
+mod h264_profile;
 mod live_chat;
 mod live_chat_persistence;
 mod live_layout;
@@ -30,6 +31,7 @@ mod living_text_catalog;
 mod metal_compositor;
 mod mpeg_ts;
 mod native_preview_host;
+mod ndi;
 mod noise_cleanup;
 mod oauth;
 mod pipeline;
@@ -44,6 +46,7 @@ mod prophet_admin_api;
 mod protocol;
 mod publish_clips;
 mod recording;
+mod remote_control;
 mod repair;
 mod repair_service;
 mod resource_authority;
@@ -170,6 +173,21 @@ use crate::youtube::{
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // One-shot permission helper mode: `videorc-backend --request-screen-access`
+    // asks macOS for Screen Recording permission through the real Apple API
+    // (CGRequestScreenCaptureAccess — the system prompt appears only when the
+    // state is not-determined) and exits immediately. The desktop shell spawns
+    // this during onboarding, before the backend service itself may start;
+    // Electron has no screen-request API and desktopCapturer enumeration does
+    // not reliably prompt on macOS 14.4+.
+    #[cfg(target_os = "macos")]
+    if std::env::args().any(|arg| arg == "--request-screen-access") {
+        std::process::exit(if screen_capture::request_screen_capture_access() {
+            0
+        } else {
+            1
+        });
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::from_default_env().add_directive("videorc_backend=info".parse()?),
@@ -288,6 +306,12 @@ async fn main() -> Result<()> {
     std::io::stdout().flush()?;
 
     state.emit_log("info", "Videorc backend ready.");
+    if let Err(error) = sync_remote_discovery_file(&state) {
+        state.emit_log(
+            "warn",
+            format!("Remote-control discovery file could not be written: {error:#}"),
+        );
+    }
     // Restore the signed-in account's verified entitlement at boot so a
     // premium user's multistream limits survive an app restart without
     // touching the AI tab first (fail-closed: no stored session -> basic).
@@ -383,6 +407,9 @@ async fn shutdown_signal(state: AppState) {
         "info",
         "Backend shutdown requested; stopping caption, capture, and artifact processes.",
     );
+    if let Some(path) = crate::remote_control::discovery_path(state.database.path()) {
+        crate::remote_control::remove_discovery(&path);
+    }
     captions::shutdown_caption_runtime(&state).await;
     state.noise_cleanup.interrupt_all_for_shutdown();
     shutdown_capture_processes(state.clone()).await;
@@ -3271,6 +3298,26 @@ impl ConnectionEventFilter {
     }
 }
 
+/// Remote sockets must not widen their locked event filter: the
+/// remote.state/remote.ack inclusion IS the leak boundary.
+fn deny_remote_connection_control(text: &str) -> Option<ServerResponse> {
+    let command: serde_json::Value = serde_json::from_str(text).ok()?;
+    let method = command.get("method").and_then(|method| method.as_str())?;
+    if !matches!(method, "events.setExcluded" | "events.setIncluded") {
+        return None;
+    }
+    let id = command
+        .get("id")
+        .and_then(|id| id.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Some(ServerResponse::error(
+        id,
+        "forbidden-method",
+        "Remote-control connections cannot change their event filter.",
+    ))
+}
+
 /// Handles connection-scoped control commands ("events.setExcluded" and
 /// "events.setIncluded") that
 /// mutate this socket's event filter instead of shared app state. Returns None
@@ -3326,6 +3373,7 @@ const WEBSOCKET_RELIABLE_QUEUE_CAPACITY: usize = 128;
 const WEBSOCKET_COMMAND_QUEUE_CAPACITY: usize = 64;
 const WEBSOCKET_TELEMETRY_KIND_CAPACITY: usize = 32;
 const WEBSOCKET_LAYOUT_CONCURRENCY: usize = 8;
+const WEBSOCKET_READ_ONLY_CONCURRENCY: usize = 4;
 // The renderer already sends live audio updates single-flight/latest-wins.
 // Keep the transport path independently bounded so a malformed/raw client
 // cannot build a task backlog, while session.stop remains dispatchable during
@@ -3818,6 +3866,21 @@ fn production_websocket_command_handler(role: BackendRole) -> WebSocketCommandHa
     })
 }
 
+/// Pure state reads that must never queue behind a multi-second stateful
+/// command (`session.start`/`session.stop` awaits the MP4 export inline). The
+/// serial dispatcher starved `preview.surface.status` behind exactly that,
+/// and the renderer's 5s budget turned every recording stop into "Backend
+/// request timed out" toasts (2026-07-16 owner incident). Each method here is
+/// verified read-only: it locks, clones, and answers.
+fn websocket_command_is_read_only(text: &str) -> bool {
+    serde_json::from_str::<ClientCommand>(text).is_ok_and(|command| {
+        matches!(
+            command.method.as_str(),
+            "preview.surface.status" | "compositor.status" | "diagnostics.stats" | "health.ping"
+        )
+    })
+}
+
 fn websocket_command_may_overlap(text: &str) -> bool {
     serde_json::from_str::<ClientCommand>(text).is_ok_and(|command| {
         matches!(
@@ -3878,11 +3941,46 @@ async fn run_websocket_command_dispatcher(
 ) {
     let mut layout_tasks = tokio::task::JoinSet::new();
     let mut audio_processing_tasks = tokio::task::JoinSet::new();
+    let mut read_only_tasks = tokio::task::JoinSet::new();
+    // At most ONE stateful mutation runs at a time; it is a barrier for every
+    // later non-read command but runs as a task so read-only queries keep
+    // answering while it is in flight (a session.stop awaits the MP4 export
+    // inline — serial dispatch starved preview.surface.status for its whole
+    // duration, the 2026-07-16 owner incident).
+    let mut stateful_task: Option<tokio::task::JoinHandle<bool>> = None;
 
     while let Some(text) = commands.recv().await {
         command_metrics.record_dequeue_oldest();
         reap_websocket_audio_processing_commands(&mut audio_processing_tasks);
+        while read_only_tasks.try_join_next().is_some() {}
+        // Read-only queries answer concurrently with ANY in-flight command —
+        // they are never an ordering barrier and no barrier waits for them.
+        if websocket_command_is_read_only(text.as_str()) {
+            if read_only_tasks.len() >= WEBSOCKET_READ_ONLY_CONCURRENCY
+                && let Some(completed) = read_only_tasks.join_next().await
+                && let Err(error) = completed
+            {
+                tracing::warn!("WebSocket read-only command task failed: {error}");
+            }
+            let command_state = state.clone();
+            let response_tx = outgoing.clone();
+            let response_metrics = reliable_metrics.clone();
+            let response_pressure = slow_pressure.clone();
+            let handler = command_handler.clone();
+            read_only_tasks.spawn(async move {
+                let response = handler(command_state, text).await;
+                let _ = queue_websocket_response(
+                    &response_tx,
+                    &response_metrics,
+                    &response_pressure,
+                    response,
+                )
+                .await;
+            });
+            continue;
+        }
         if websocket_command_may_overlap(text.as_str()) {
+            await_websocket_stateful_barrier(&mut stateful_task).await;
             if layout_tasks.len() >= WEBSOCKET_LAYOUT_CONCURRENCY
                 && let Some(completed) = layout_tasks.join_next().await
                 && let Err(error) = completed
@@ -3908,6 +4006,7 @@ async fn run_websocket_command_dispatcher(
         }
 
         if let Some(command_id) = websocket_audio_processing_command_id(text.as_str()) {
+            await_websocket_stateful_barrier(&mut stateful_task).await;
             // Audio gain/mute is independent from scene layout. Do not hold the
             // dispatcher during FFmpeg's acknowledgement cadence; a following
             // session.stop must be able to publish its stopping marker.
@@ -3948,18 +4047,158 @@ async fn run_websocket_command_dispatcher(
         // until this mutation completes. session.stop is the deliberate narrow
         // exception for an in-flight live audio acknowledgement: the backend's
         // session mutex and stop marker preserve native ordering.
+        await_websocket_stateful_barrier(&mut stateful_task).await;
         drain_websocket_layout_commands(&mut layout_tasks).await;
         if !websocket_command_is_session_stop(text.as_str()) {
             drain_websocket_audio_processing_commands(&mut audio_processing_tasks).await;
         }
-        let response = command_handler(state.clone(), text).await;
-        if !queue_websocket_response(&outgoing, &reliable_metrics, &slow_pressure, response).await {
-            break;
-        }
+        let command_state = state.clone();
+        let response_tx = outgoing.clone();
+        let response_metrics = reliable_metrics.clone();
+        let response_pressure = slow_pressure.clone();
+        let handler = command_handler.clone();
+        stateful_task = Some(tokio::spawn(async move {
+            let response = handler(command_state, text).await;
+            queue_websocket_response(
+                &response_tx,
+                &response_metrics,
+                &response_pressure,
+                response,
+            )
+            .await
+        }));
     }
 
+    await_websocket_stateful_barrier(&mut stateful_task).await;
     drain_websocket_layout_commands(&mut layout_tasks).await;
     drain_websocket_audio_processing_commands(&mut audio_processing_tasks).await;
+    while read_only_tasks.join_next().await.is_some() {}
+}
+
+/// Wait for the in-flight stateful mutation (if any) before dispatching the
+/// next non-read-only command — mutation ordering is exactly the old serial
+/// dispatcher's; only read-only queries bypass the barrier.
+async fn await_websocket_stateful_barrier(
+    stateful_task: &mut Option<tokio::task::JoinHandle<bool>>,
+) {
+    if let Some(task) = stateful_task.take()
+        && let Err(error) = task.await
+    {
+        tracing::warn!("WebSocket stateful command task failed: {error}");
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RemoteControlStatus {
+    enabled: bool,
+    /// Full token — this RPC (and the remote.control.status event) is
+    /// renderer/admin-only; the renderer renders the copy field + QR. Remote
+    /// sockets can never call it, and their locked included-event filter
+    /// (remote.state/remote.ack only) never relays the event to them.
+    token: Option<String>,
+    port: u16,
+    connected_clients: usize,
+    discovery_path: Option<String>,
+}
+
+fn remote_control_status(state: &AppState) -> RemoteControlStatus {
+    let (enabled, token, connected_clients) = state
+        .remote_control
+        .lock()
+        .map(|runtime| {
+            (
+                runtime.enabled,
+                runtime.token.clone(),
+                runtime.connected_clients,
+            )
+        })
+        .unwrap_or((false, None, 0));
+    RemoteControlStatus {
+        token: enabled.then_some(token).flatten(),
+        enabled,
+        port: state.port,
+        connected_clients,
+        discovery_path: crate::remote_control::discovery_path(state.database.path())
+            .map(|path| path.display().to_string()),
+    }
+}
+
+fn sync_remote_discovery_file(state: &AppState) -> anyhow::Result<()> {
+    let Some(path) = crate::remote_control::discovery_path(state.database.path()) else {
+        return Ok(());
+    };
+    let (enabled, token) = state
+        .remote_control
+        .lock()
+        .map(|runtime| (runtime.enabled, runtime.token.clone()))
+        .unwrap_or((false, None));
+    match (enabled, token) {
+        (true, Some(token)) => {
+            crate::remote_control::write_discovery(&path, "127.0.0.1", state.port, &token)
+        }
+        _ => {
+            crate::remote_control::remove_discovery(&path);
+            Ok(())
+        }
+    }
+}
+
+fn enable_remote_control(state: &AppState) -> anyhow::Result<RemoteControlStatus> {
+    {
+        let mut runtime = state
+            .remote_control
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Remote control state unavailable."))?;
+        if runtime.token.is_none() {
+            runtime.token = Some(crate::remote_control::generate_token());
+        }
+        runtime.enabled = true;
+        crate::remote_control::persist_enabled(true, runtime.token.as_deref())?;
+    }
+    sync_remote_discovery_file(state)?;
+    let status = remote_control_status(state);
+    state.emit_event("remote.control.status", status.clone());
+    Ok(status)
+}
+
+fn disable_remote_control(state: &AppState) -> anyhow::Result<RemoteControlStatus> {
+    {
+        let mut runtime = state
+            .remote_control
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Remote control state unavailable."))?;
+        runtime.enabled = false;
+        crate::remote_control::persist_enabled(false, None)?;
+    }
+    sync_remote_discovery_file(state)?;
+    // Cut live remote clients immediately.
+    state
+        .remote_generation
+        .send_modify(|generation| *generation += 1);
+    let status = remote_control_status(state);
+    state.emit_event("remote.control.status", status.clone());
+    Ok(status)
+}
+
+fn regenerate_remote_control_token(state: &AppState) -> anyhow::Result<RemoteControlStatus> {
+    {
+        let mut runtime = state
+            .remote_control
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Remote control state unavailable."))?;
+        runtime.token = Some(crate::remote_control::generate_token());
+        if runtime.enabled {
+            crate::remote_control::persist_enabled(true, runtime.token.as_deref())?;
+        }
+    }
+    sync_remote_discovery_file(state)?;
+    state
+        .remote_generation
+        .send_modify(|generation| *generation += 1);
+    let status = remote_control_status(state);
+    state.emit_event("remote.control.status", status.clone());
+    Ok(status)
 }
 
 async fn ws_handler(
@@ -3967,8 +4206,17 @@ async fn ws_handler(
     Query(query): Query<WsQuery>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let Some(role) = authenticate_backend_token(&query.token, &state.token, &state.admin_token)
-    else {
+    let role =
+        authenticate_backend_token(&query.token, &state.token, &state.admin_token).or_else(|| {
+            let runtime = state.remote_control.lock().ok()?;
+            (runtime.enabled
+                && crate::backend_authority::authenticate_remote_token(
+                    &query.token,
+                    runtime.token.as_deref(),
+                ))
+            .then_some(BackendRole::Remote)
+        });
+    let Some(role) = role else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
 
@@ -4052,10 +4300,11 @@ async fn relay_websocket_events(
 }
 
 async fn websocket_session(socket: WebSocket, state: AppState, role: BackendRole) {
-    websocket_session_with_handler_and_redaction(
+    websocket_session_with_handler_role_and_redaction(
         socket,
         state,
         production_websocket_command_handler(role),
+        role,
         role == BackendRole::Renderer,
     )
     .await;
@@ -4067,13 +4316,21 @@ async fn websocket_session_with_handler(
     state: AppState,
     command_handler: WebSocketCommandHandler,
 ) {
-    websocket_session_with_handler_and_redaction(socket, state, command_handler, false).await;
+    websocket_session_with_handler_role_and_redaction(
+        socket,
+        state,
+        command_handler,
+        BackendRole::Admin,
+        false,
+    )
+    .await;
 }
 
-async fn websocket_session_with_handler_and_redaction(
+async fn websocket_session_with_handler_role_and_redaction(
     socket: WebSocket,
     state: AppState,
     command_handler: WebSocketCommandHandler,
+    role: BackendRole,
     redact_renderer_paths: bool,
 ) {
     let (sender, mut receiver) = socket.split();
@@ -4096,8 +4353,42 @@ async fn websocket_session_with_handler_and_redaction(
     // frame-ready lane while the main process drives presents, and unmutes
     // instantly when it must take over as the fallback pump. Full compositor
     // diagnostics remain visible at their low bounded cadence.
-    let event_filter = std::sync::Arc::new(std::sync::Mutex::new(ConnectionEventFilter::default()));
+    // Remote clients only ever see their own lane: state projections and
+    // intent acks. This is transport-level leak safety — no recording paths,
+    // tokens, or diagnostics can reach a remote socket even by accident.
+    let event_filter = std::sync::Arc::new(std::sync::Mutex::new(if role == BackendRole::Remote {
+        ConnectionEventFilter {
+            excluded: std::collections::HashSet::new(),
+            included: Some(std::collections::HashSet::from([
+                "remote.state".to_string(),
+                "remote.ack".to_string(),
+            ])),
+        }
+    } else {
+        ConnectionEventFilter::default()
+    }));
     let event_filter_for_events = event_filter.clone();
+    // Count Remote clients with a Drop guard: every exit path (early return on
+    // a failed ready send, read-loop break, panic) must decrement, and the
+    // count feeds Settings via remote.control.status — a leak shows users a
+    // phantom connected deck forever.
+    struct RemoteClientCountGuard(AppState);
+    impl Drop for RemoteClientCountGuard {
+        fn drop(&mut self) {
+            if let Ok(mut runtime) = self.0.remote_control.lock() {
+                runtime.connected_clients = runtime.connected_clients.saturating_sub(1);
+            }
+            self.0
+                .emit_event("remote.control.status", remote_control_status(&self.0));
+        }
+    }
+    let _remote_client_guard = (role == BackendRole::Remote).then(|| {
+        if let Ok(mut runtime) = state.remote_control.lock() {
+            runtime.connected_clients = runtime.connected_clients.saturating_add(1);
+        }
+        state.emit_event("remote.control.status", remote_control_status(&state));
+        RemoteClientCountGuard(state.clone())
+    });
 
     let writer_task = tokio::spawn(run_websocket_writer(
         sender,
@@ -4151,10 +4442,21 @@ async fn websocket_session_with_handler_and_redaction(
         command_handler,
     ));
 
+    // A rotated/disabled remote token must cut existing remote sockets, not
+    // just future ones: watch the generation and close when it moves.
+    let mut remote_generation_rx = state.remote_generation.subscribe();
+    let watch_remote_generation = role == BackendRole::Remote;
+
     loop {
         let incoming = tokio::select! {
             incoming = receiver.next() => incoming,
             _ = pressure_rx.recv() => {
+                break;
+            }
+            changed = remote_generation_rx.changed(), if watch_remote_generation => {
+                if changed.is_ok() {
+                    tracing::info!("Remote-control token rotated or surface disabled; closing remote client.");
+                }
                 break;
             }
         };
@@ -4166,6 +4468,21 @@ async fn websocket_session_with_handler_and_redaction(
             Ok(Message::Text(text)) => {
                 // Connection-local control messages never reach the shared
                 // dispatcher (the exclusion set is per socket).
+                if role == BackendRole::Remote
+                    && let Some(response) = deny_remote_connection_control(text.as_str())
+                {
+                    if !send_tracked_reliable_websocket_item(
+                        &outgoing_tx,
+                        &reliable_metrics,
+                        Message::Text(serde_json::to_string(&response).unwrap_or_default().into()),
+                        &slow_pressure,
+                    )
+                    .await
+                    {
+                        break;
+                    }
+                    continue;
+                }
                 if let Some(response) = handle_connection_control(&event_filter, text.as_str()) {
                     if !queue_websocket_response(
                         &outgoing_tx,
@@ -4210,6 +4527,7 @@ async fn websocket_session_with_handler_and_redaction(
     // Every command read from the socket is accepted work. Closing this
     // connection stops new intake, but the detached dispatcher drains the
     // accepted queue so native/source mutations are never canceled halfway.
+    // (Remote client count is decremented by RemoteClientCountGuard's Drop.)
     drop(command_tx);
     drop(command_dispatcher_task);
     event_task.abort();
@@ -4698,16 +5016,22 @@ async fn handle_text_message_with_role(
             }
         }
         "captions.start" => {
-            let language = command
-                .params
-                .get("language")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-                .filter(|value| !value.trim().is_empty());
-            match captions::start_captions(state, language).await {
-                Ok(status) => ServerResponse::ok(command.id, status),
+            let raw = if command.params.is_null() {
+                serde_json::json!({})
+            } else {
+                command.params
+            };
+            match serde_json::from_value::<captions::CaptionStartParams>(raw) {
+                Ok(params) => match captions::start_captions(state, params).await {
+                    Ok(status) => ServerResponse::ok(command.id, status),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "captions-start-failed",
+                        error.to_string(),
+                    ),
+                },
                 Err(error) => {
-                    ServerResponse::error(command.id, "captions-start-failed", error.to_string())
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
                 }
             }
         }
@@ -4993,6 +5317,83 @@ async fn handle_text_message_with_role(
         "preview.surface.take_native_host_commands" => {
             let commands = take_native_preview_host_commands(state).await;
             ServerResponse::ok(command.id, commands)
+        }
+        "remote.control.status" => ServerResponse::ok(command.id, remote_control_status(state)),
+        "remote.control.enable" => match enable_remote_control(state) {
+            Ok(status) => ServerResponse::ok(command.id, status),
+            Err(error) => ServerResponse::error(command.id, "remote-control", error.to_string()),
+        },
+        "remote.control.disable" => match disable_remote_control(state) {
+            Ok(status) => ServerResponse::ok(command.id, status),
+            Err(error) => ServerResponse::error(command.id, "remote-control", error.to_string()),
+        },
+        "remote.control.regenerate" => match regenerate_remote_control_token(state) {
+            Ok(status) => ServerResponse::ok(command.id, status),
+            Err(error) => ServerResponse::error(command.id, "remote-control", error.to_string()),
+        },
+        "remote.surface.publish" => {
+            // Renderer-published catalog + state projection. The state event
+            // is the ONLY payload remote sockets receive (their event filter
+            // is locked to remote.state/remote.ack).
+            let describe = command.params.get("describe").cloned();
+            let state_snapshot = command.params.get("state").cloned();
+            if let Ok(mut runtime) = state.remote_control.lock() {
+                if let Some(describe) = describe {
+                    runtime.describe = Some(describe);
+                }
+                if let Some(snapshot) = state_snapshot.clone() {
+                    runtime.state = Some(snapshot);
+                }
+            }
+            if let Some(snapshot) = state_snapshot {
+                state.emit_event("remote.state", snapshot);
+            }
+            ServerResponse::ok(command.id, serde_json::json!({ "ok": true }))
+        }
+        "remote.intent.ack" => {
+            state.emit_event("remote.ack", command.params);
+            ServerResponse::ok(command.id, serde_json::json!({ "ok": true }))
+        }
+        "remote.describe" => {
+            let (describe, snapshot) = state
+                .remote_control
+                .lock()
+                .map(|runtime| (runtime.describe.clone(), runtime.state.clone()))
+                .unwrap_or((None, None));
+            ServerResponse::ok(
+                command.id,
+                serde_json::json!({ "describe": describe, "state": snapshot, "protocol": 1 }),
+            )
+        }
+        "remote.intent" => {
+            match serde_json::from_value::<crate::remote_control::RemoteIntent>(
+                command.params.clone(),
+            ) {
+                Ok(intent) => {
+                    if let Err(message) = intent.validate() {
+                        return ServerResponse::error(command.id, "invalid-intent", message);
+                    }
+                    let ticket = state
+                        .remote_control
+                        .lock()
+                        .map(|mut runtime| runtime.admit_intent(&intent, std::time::Instant::now()))
+                        .unwrap_or(crate::remote_control::RemoteIntentTicket {
+                            intent_id: String::new(),
+                            accepted: false,
+                            message: Some("Remote control state unavailable.".to_string()),
+                        });
+                    if ticket.accepted {
+                        state.emit_event(
+                            "remote.intent",
+                            serde_json::json!({ "intentId": ticket.intent_id, "intent": intent }),
+                        );
+                    }
+                    ServerResponse::ok(command.id, ticket)
+                }
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-intent", error.to_string())
+                }
+            }
         }
         "compositor.status" => {
             let status = compositor_status(state).await;
@@ -5438,18 +5839,75 @@ async fn handle_text_message_with_role(
             }
         }
         "sessions.list" => {
-            // Library rewrite L1: the manager wants the whole library, not the
-            // dashboard's last-20 slice; the limit is caller-chosen, bounded.
-            let limit = command
-                .params
-                .get("limit")
-                .and_then(|value| value.as_u64())
-                .unwrap_or(20)
-                .clamp(1, 500) as usize;
-            match state.database.list_sessions(limit) {
-                Ok(sessions) => ServerResponse::ok(command.id, sessions),
+            match serde_json::from_value::<protocol::SessionListParams>(command.params) {
+                Ok(params) => match state
+                    .database
+                    .list_session_items_page(params.cursor.as_deref(), params.limit)
+                {
+                    Ok(page) => ServerResponse::ok(command.id, page),
+                    Err(error) => {
+                        ServerResponse::error(command.id, "sessions-list-failed", error.to_string())
+                    }
+                },
                 Err(error) => {
-                    ServerResponse::error(command.id, "sessions-list-failed", error.to_string())
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "sessions.healthEvents.list" => {
+            match serde_json::from_value::<protocol::SessionDetailListParams>(command.params) {
+                Ok(params) => match state.database.list_health_events_page(
+                    &params.session_id,
+                    params.cursor.as_deref(),
+                    params.limit,
+                ) {
+                    Ok(page) => ServerResponse::ok(command.id, page),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "session-health-events-list-failed",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "sessions.logs.list" => {
+            match serde_json::from_value::<protocol::SessionDetailListParams>(command.params) {
+                Ok(params) => match state.database.list_session_logs_page(
+                    &params.session_id,
+                    params.cursor.as_deref(),
+                    params.limit,
+                ) {
+                    Ok(page) => ServerResponse::ok(command.id, page),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "session-logs-list-failed",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "sessions.aiArtifacts.list" => {
+            match serde_json::from_value::<protocol::SessionDetailListParams>(command.params) {
+                Ok(params) => match state.database.list_ai_artifacts_page(
+                    &params.session_id,
+                    params.cursor.as_deref(),
+                    params.limit,
+                ) {
+                    Ok(page) => ServerResponse::ok(command.id, page),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "session-ai-artifacts-list-failed",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
                 }
             }
         }
@@ -5782,6 +6240,25 @@ async fn handle_text_message_with_role(
                     Err(error) => ServerResponse::error(
                         command.id,
                         "live-chat-send-operations-list-failed",
+                        error.to_string(),
+                    ),
+                }
+            }
+        }
+        "liveChat.sendOperations.latest" => {
+            let session_id = command
+                .params
+                .get("sessionId")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            if session_id.is_empty() {
+                ServerResponse::error(command.id, "invalid-params", "sessionId is required.")
+            } else {
+                match state.database.latest_chat_send_operation(session_id) {
+                    Ok(operation) => ServerResponse::ok(command.id, operation),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "live-chat-send-operation-latest-failed",
                         error.to_string(),
                     ),
                 }
@@ -6672,9 +7149,11 @@ async fn handle_text_message_with_role(
         "recording.status" => ServerResponse::ok(command.id, current_recording_status(state).await),
         "admin.connection.get" => match prophet_admin_api::get_connection() {
             Ok(connection) => ServerResponse::ok(command.id, connection),
-            Err(error) => {
-                ServerResponse::error(command.id, "admin-connection-read-failed", error.to_string())
-            }
+            Err(error) => ServerResponse::error(
+                command.id,
+                "admin-connection-read-failed",
+                error.to_string(),
+            ),
         },
         "admin.connection.set" => {
             match serde_json::from_value::<protocol::AdminConnectionSetParams>(command.params) {
@@ -6712,9 +7191,11 @@ async fn handle_text_message_with_role(
                     error.to_string(),
                 ),
             },
-            Err(error) => {
-                ServerResponse::error(command.id, "admin-connection-clear-failed", error.to_string())
-            }
+            Err(error) => ServerResponse::error(
+                command.id,
+                "admin-connection-clear-failed",
+                error.to_string(),
+            ),
         },
         "admin.connection.test" => {
             match serde_json::from_value::<protocol::AdminConnectionTestParams>(command.params) {
@@ -6740,15 +7221,51 @@ async fn handle_text_message_with_role(
                 .await
                 {
                     Ok(result) => ServerResponse::ok(command.id, result),
-                    Err(error) => {
-                        ServerResponse::error(command.id, "admin-register-failed", error.to_string())
-                    }
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "admin-register-failed",
+                        error.to_string(),
+                    ),
                 },
                 Err(error) => {
                     ServerResponse::error(command.id, "invalid-params", error.to_string())
                 }
             }
         }
+        "admin.auth.login" => {
+            match serde_json::from_value::<protocol::AdminAuthLoginParams>(command.params) {
+                Ok(params) => match prophet_admin_api::login_admin(
+                    params.base_url.as_deref(),
+                    &params.email,
+                    &params.password,
+                    params.organization.as_deref(),
+                )
+                .await
+                {
+                    Ok(identity) => ServerResponse::ok(command.id, identity),
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "admin-auth-login-failed",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "admin.auth.get" => match prophet_admin_api::get_auth_identity() {
+            Ok(identity) => ServerResponse::ok(command.id, identity),
+            Err(error) => {
+                ServerResponse::error(command.id, "admin-auth-read-failed", error.to_string())
+            }
+        },
+        "admin.auth.logout" => match prophet_admin_api::logout_admin().await {
+            Ok(()) => ServerResponse::ok(command.id, serde_json::json!({ "loggedOut": true })),
+            Err(error) => {
+                ServerResponse::error(command.id, "admin-auth-logout-failed", error.to_string())
+            }
+        },
         "livingText.books.list" => ServerResponse::ok(command.id, living_text::list_books()),
         "livingText.availableTranslations.list" => {
             match prophet_admin_api::ProphetAdminApiClient::connect() {
@@ -6776,15 +7293,19 @@ async fn handle_text_message_with_role(
                     error.to_string(),
                 ),
             },
-            Err(error) => {
-                ServerResponse::error(command.id, "living-text-store-unavailable", error.to_string())
-            }
+            Err(error) => ServerResponse::error(
+                command.id,
+                "living-text-store-unavailable",
+                error.to_string(),
+            ),
         },
         "livingText.sync" => {
             match serde_json::from_value::<protocol::LivingTextSyncParams>(command.params) {
                 Ok(params) => match prophet_admin_api::ProphetAdminApiClient::connect() {
                     Ok(admin) => match living_text::LivingTextStore::open() {
-                        Ok(mut store) => match store.sync_translation(&admin, &params.translation_code).await
+                        Ok(mut store) => match store
+                            .sync_translation(&admin, &params.translation_code)
+                            .await
                         {
                             Ok(summary) => ServerResponse::ok(command.id, summary),
                             Err(error) => ServerResponse::error(
@@ -6839,14 +7360,16 @@ async fn handle_text_message_with_role(
         "livingText.detect" => {
             match serde_json::from_value::<protocol::LivingTextDetectParams>(command.params) {
                 Ok(params) => match living_text::LivingTextStore::open() {
-                    Ok(store) => match store.detect_and_resolve(&params.translation_code, &params.text) {
-                        Ok(citations) => ServerResponse::ok(command.id, citations),
-                        Err(error) => ServerResponse::error(
-                            command.id,
-                            "living-text-detect-failed",
-                            error.to_string(),
-                        ),
-                    },
+                    Ok(store) => {
+                        match store.detect_and_resolve(&params.translation_code, &params.text) {
+                            Ok(citations) => ServerResponse::ok(command.id, citations),
+                            Err(error) => ServerResponse::error(
+                                command.id,
+                                "living-text-detect-failed",
+                                error.to_string(),
+                            ),
+                        }
+                    }
                     Err(error) => ServerResponse::error(
                         command.id,
                         "living-text-store-unavailable",
@@ -6858,12 +7381,94 @@ async fn handle_text_message_with_role(
                 }
             }
         }
+        "livingText.search" => {
+            match serde_json::from_value::<protocol::LivingTextSearchParams>(command.params) {
+                Ok(params) => match living_text::LivingTextStore::open() {
+                    Ok(store) => {
+                        let limit = params.limit.unwrap_or(100).min(500);
+                        let book_ref = params.book.as_deref();
+                        match store.search_verses(
+                            &params.translation_code,
+                            &params.query,
+                            book_ref,
+                            limit,
+                        ) {
+                            Ok(hits) => ServerResponse::ok(command.id, hits),
+                            Err(error) => ServerResponse::error(
+                                command.id,
+                                "living-text-search-failed",
+                                error.to_string(),
+                            ),
+                        }
+                    }
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "living-text-store-unavailable",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "livingText.crossRef" => {
+            match serde_json::from_value::<protocol::LivingTextCrossRefParams>(command.params) {
+                Ok(params) => match living_text::LivingTextStore::open() {
+                    Ok(store) => {
+                        match store
+                            .resolve_reference(&params.translation_code, &params.reference_text)
+                        {
+                            Ok(verses) => ServerResponse::ok(command.id, verses),
+                            Err(error) => ServerResponse::error(
+                                command.id,
+                                "living-text-crossref-failed",
+                                error.to_string(),
+                            ),
+                        }
+                    }
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "living-text-store-unavailable",
+                        error.to_string(),
+                    ),
+                },
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
+            }
+        }
+        "ndi.start" => match serde_json::from_value::<ndi::NdiStartParams>(command.params) {
+            Ok(params) => match ndi::start(params) {
+                Ok(status) => ServerResponse::ok(command.id, status),
+                Err(error) => {
+                    ServerResponse::error(command.id, "ndi-start-failed", error.to_string())
+                }
+            },
+            Err(error) => ServerResponse::error(command.id, "invalid-params", error.to_string()),
+        },
+        "ndi.stop" => match ndi::stop() {
+            Ok(status) => ServerResponse::ok(command.id, status),
+            Err(error) => ServerResponse::error(command.id, "ndi-stop-failed", error.to_string()),
+        },
+        "ndi.status" => ServerResponse::ok(command.id, ndi::status()),
+        "ndi.frame" => match serde_json::from_value::<ndi::NdiFrameParams>(command.params) {
+            Ok(params) => match ndi::send_frame(params) {
+                Ok(ack) => ServerResponse::ok(command.id, ack),
+                Err(error) => {
+                    ServerResponse::error(command.id, "ndi-frame-failed", error.to_string())
+                }
+            },
+            Err(error) => ServerResponse::error(command.id, "invalid-params", error.to_string()),
+        },
         "admin.sermons.list" => match prophet_admin_api::ProphetAdminApiClient::connect() {
             Ok(client) => match client.list_sermons().await {
                 Ok(sermons) => ServerResponse::ok(command.id, sermons),
-                Err(error) => {
-                    ServerResponse::error(command.id, "admin-sermons-list-failed", error.to_string())
-                }
+                Err(error) => ServerResponse::error(
+                    command.id,
+                    "admin-sermons-list-failed",
+                    error.to_string(),
+                ),
             },
             Err(error) => ServerResponse::error(
                 command.id,
@@ -7048,8 +7653,9 @@ async fn handle_text_message_with_role(
                     "admin.videos.update requires an id.",
                 )
             } else {
-                match serde_json::from_value::<prophet_admin_api::UpdateVideoRequest>(command.params)
-                {
+                match serde_json::from_value::<prophet_admin_api::UpdateVideoRequest>(
+                    command.params,
+                ) {
                     Ok(request) => match prophet_admin_api::ProphetAdminApiClient::connect() {
                         Ok(client) => match client.update_video(&id, &request).await {
                             Ok(video) => ServerResponse::ok(command.id, video),
@@ -7120,9 +7726,10 @@ async fn handle_text_message_with_role(
             } else {
                 match prophet_admin_api::ProphetAdminApiClient::connect() {
                     Ok(client) => match client.toggle_video_featured(&id).await {
-                        Ok(is_featured) => {
-                            ServerResponse::ok(command.id, serde_json::json!({ "isFeatured": is_featured }))
-                        }
+                        Ok(is_featured) => ServerResponse::ok(
+                            command.id,
+                            serde_json::json!({ "isFeatured": is_featured }),
+                        ),
                         Err(error) => ServerResponse::error(
                             command.id,
                             "admin-video-toggle-featured-failed",
@@ -7178,8 +7785,11 @@ async fn handle_text_message_with_role(
             }
         }
         "admin.videos.youtube_search" => {
-            let query =
-                command.params.get("query").and_then(serde_json::Value::as_str).unwrap_or_default();
+            let query = command
+                .params
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
             if query.trim().is_empty() {
                 ServerResponse::error(
                     command.id,
@@ -7205,7 +7815,8 @@ async fn handle_text_message_with_role(
             }
         }
         "admin.videos.youtube_import" => {
-            match serde_json::from_value::<prophet_admin_api::YoutubeImportRequest>(command.params) {
+            match serde_json::from_value::<prophet_admin_api::YoutubeImportRequest>(command.params)
+            {
                 Ok(request) => match prophet_admin_api::ProphetAdminApiClient::connect() {
                     Ok(client) => match client.import_from_youtube(&request).await {
                         Ok(videos) => ServerResponse::ok(command.id, videos),
@@ -7262,7 +7873,7 @@ async fn handle_text_message_with_role(
                             status.as_deref(),
                             country.as_deref(),
                             page,
-                            page_size
+                            page_size,
                         )
                         .await
                     {
@@ -7317,8 +7928,9 @@ async fn handle_text_message_with_role(
                     "admin.members.update requires an id.",
                 )
             } else {
-                match serde_json::from_value::<prophet_admin_api::UpdateMemberRequest>(command.params)
-                {
+                match serde_json::from_value::<prophet_admin_api::UpdateMemberRequest>(
+                    command.params,
+                ) {
                     Ok(request) => match prophet_admin_api::ProphetAdminApiClient::connect() {
                         Ok(client) => match client.update_member(&id, &request).await {
                             Ok(member) => ServerResponse::ok(command.id, member),
@@ -7562,8 +8174,9 @@ async fn handle_text_message_with_role(
                     "admin.events.update requires an id.",
                 )
             } else {
-                match serde_json::from_value::<prophet_admin_api::UpdateEventRequest>(command.params)
-                {
+                match serde_json::from_value::<prophet_admin_api::UpdateEventRequest>(
+                    command.params,
+                ) {
                     Ok(request) => match prophet_admin_api::ProphetAdminApiClient::connect() {
                         Ok(client) => match client.update_event(&id, &request).await {
                             Ok(event) => ServerResponse::ok(command.id, event),
@@ -7626,18 +8239,26 @@ async fn handle_text_message_with_role(
                 .unwrap_or_default()
                 .to_string();
             if event_id.is_empty() {
-                ServerResponse::error(command.id, "invalid-params", "admin.attendance.open requires an eventId.")
+                ServerResponse::error(
+                    command.id,
+                    "invalid-params",
+                    "admin.attendance.open requires an eventId.",
+                )
             } else {
                 match prophet_admin_api::ProphetAdminApiClient::connect() {
                     Ok(client) => match client.open_attendance(&event_id).await {
                         Ok(session) => ServerResponse::ok(command.id, session),
-                        Err(error) => {
-                            ServerResponse::error(command.id, "attendance-open-failed", error.to_string())
-                        }
+                        Err(error) => ServerResponse::error(
+                            command.id,
+                            "attendance-open-failed",
+                            error.to_string(),
+                        ),
                     },
-                    Err(error) => {
-                        ServerResponse::error(command.id, "admin-connection-not-configured", error.to_string())
-                    }
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "admin-connection-not-configured",
+                        error.to_string(),
+                    ),
                 }
             }
         }
@@ -7649,18 +8270,26 @@ async fn handle_text_message_with_role(
                 .unwrap_or_default()
                 .to_string();
             if event_id.is_empty() {
-                ServerResponse::error(command.id, "invalid-params", "admin.attendance.close requires an eventId.")
+                ServerResponse::error(
+                    command.id,
+                    "invalid-params",
+                    "admin.attendance.close requires an eventId.",
+                )
             } else {
                 match prophet_admin_api::ProphetAdminApiClient::connect() {
                     Ok(client) => match client.close_attendance(&event_id).await {
                         Ok(session) => ServerResponse::ok(command.id, session),
-                        Err(error) => {
-                            ServerResponse::error(command.id, "attendance-close-failed", error.to_string())
-                        }
+                        Err(error) => ServerResponse::error(
+                            command.id,
+                            "attendance-close-failed",
+                            error.to_string(),
+                        ),
                     },
-                    Err(error) => {
-                        ServerResponse::error(command.id, "admin-connection-not-configured", error.to_string())
-                    }
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "admin-connection-not-configured",
+                        error.to_string(),
+                    ),
                 }
             }
         }
@@ -7672,18 +8301,26 @@ async fn handle_text_message_with_role(
                 .unwrap_or_default()
                 .to_string();
             if event_id.is_empty() {
-                ServerResponse::error(command.id, "invalid-params", "admin.attendance.qr requires an eventId.")
+                ServerResponse::error(
+                    command.id,
+                    "invalid-params",
+                    "admin.attendance.qr requires an eventId.",
+                )
             } else {
                 match prophet_admin_api::ProphetAdminApiClient::connect() {
                     Ok(client) => match client.get_attendance_qr(&event_id).await {
                         Ok(qr) => ServerResponse::ok(command.id, qr),
-                        Err(error) => {
-                            ServerResponse::error(command.id, "attendance-qr-failed", error.to_string())
-                        }
+                        Err(error) => ServerResponse::error(
+                            command.id,
+                            "attendance-qr-failed",
+                            error.to_string(),
+                        ),
                     },
-                    Err(error) => {
-                        ServerResponse::error(command.id, "admin-connection-not-configured", error.to_string())
-                    }
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "admin-connection-not-configured",
+                        error.to_string(),
+                    ),
                 }
             }
         }
@@ -7695,18 +8332,26 @@ async fn handle_text_message_with_role(
                 .unwrap_or_default()
                 .to_string();
             if event_id.is_empty() {
-                ServerResponse::error(command.id, "invalid-params", "admin.attendance.list requires an eventId.")
+                ServerResponse::error(
+                    command.id,
+                    "invalid-params",
+                    "admin.attendance.list requires an eventId.",
+                )
             } else {
                 match prophet_admin_api::ProphetAdminApiClient::connect() {
                     Ok(client) => match client.list_attendance(&event_id).await {
                         Ok(list) => ServerResponse::ok(command.id, list),
-                        Err(error) => {
-                            ServerResponse::error(command.id, "attendance-list-failed", error.to_string())
-                        }
+                        Err(error) => ServerResponse::error(
+                            command.id,
+                            "attendance-list-failed",
+                            error.to_string(),
+                        ),
                     },
-                    Err(error) => {
-                        ServerResponse::error(command.id, "admin-connection-not-configured", error.to_string())
-                    }
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "admin-connection-not-configured",
+                        error.to_string(),
+                    ),
                 }
             }
         }
@@ -7718,15 +8363,23 @@ async fn handle_text_message_with_role(
                 .unwrap_or_default()
                 .to_string();
             if event_id.is_empty() {
-                ServerResponse::error(command.id, "invalid-params", "admin.attendance.manual requires an eventId.")
+                ServerResponse::error(
+                    command.id,
+                    "invalid-params",
+                    "admin.attendance.manual requires an eventId.",
+                )
             } else {
-                match serde_json::from_value::<prophet_admin_api::ManualCheckInRequest>(command.params.clone()) {
+                match serde_json::from_value::<prophet_admin_api::ManualCheckInRequest>(
+                    command.params.clone(),
+                ) {
                     Ok(request) => match prophet_admin_api::ProphetAdminApiClient::connect() {
                         Ok(client) => match client.manual_check_in(&event_id, &request).await {
                             Ok(record) => ServerResponse::ok(command.id, record),
-                            Err(error) => {
-                                ServerResponse::error(command.id, "attendance-manual-failed", error.to_string())
-                            }
+                            Err(error) => ServerResponse::error(
+                                command.id,
+                                "attendance-manual-failed",
+                                error.to_string(),
+                            ),
                         },
                         Err(error) => ServerResponse::error(
                             command.id,
@@ -7734,7 +8387,9 @@ async fn handle_text_message_with_role(
                             error.to_string(),
                         ),
                     },
-                    Err(error) => ServerResponse::error(command.id, "invalid-params", error.to_string()),
+                    Err(error) => {
+                        ServerResponse::error(command.id, "invalid-params", error.to_string())
+                    }
                 }
             }
         }
@@ -7759,17 +8414,24 @@ async fn handle_text_message_with_role(
                 )
             } else {
                 match prophet_admin_api::ProphetAdminApiClient::connect() {
-                    Ok(client) => match client.delete_attendance_record(&event_id, &record_id).await {
-                        Ok(()) => {
-                            ServerResponse::ok(command.id, serde_json::json!({ "deleted": true }))
+                    Ok(client) => {
+                        match client.delete_attendance_record(&event_id, &record_id).await {
+                            Ok(()) => ServerResponse::ok(
+                                command.id,
+                                serde_json::json!({ "deleted": true }),
+                            ),
+                            Err(error) => ServerResponse::error(
+                                command.id,
+                                "attendance-delete-failed",
+                                error.to_string(),
+                            ),
                         }
-                        Err(error) => {
-                            ServerResponse::error(command.id, "attendance-delete-failed", error.to_string())
-                        }
-                    },
-                    Err(error) => {
-                        ServerResponse::error(command.id, "admin-connection-not-configured", error.to_string())
                     }
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "admin-connection-not-configured",
+                        error.to_string(),
+                    ),
                 }
             }
         }
@@ -7794,18 +8456,26 @@ async fn handle_text_message_with_role(
                 .unwrap_or_default()
                 .to_string();
             if id.is_empty() {
-                ServerResponse::error(command.id, "invalid-params", "admin.units.get requires an id.")
+                ServerResponse::error(
+                    command.id,
+                    "invalid-params",
+                    "admin.units.get requires an id.",
+                )
             } else {
                 match prophet_admin_api::ProphetAdminApiClient::connect() {
                     Ok(client) => match client.get_unit(&id).await {
                         Ok(unit) => ServerResponse::ok(command.id, unit),
-                        Err(error) => {
-                            ServerResponse::error(command.id, "admin-unit-get-failed", error.to_string())
-                        }
+                        Err(error) => ServerResponse::error(
+                            command.id,
+                            "admin-unit-get-failed",
+                            error.to_string(),
+                        ),
                     },
-                    Err(error) => {
-                        ServerResponse::error(command.id, "admin-connection-not-configured", error.to_string())
-                    }
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "admin-connection-not-configured",
+                        error.to_string(),
+                    ),
                 }
             }
         }
@@ -7845,7 +8515,8 @@ async fn handle_text_message_with_role(
                     "admin.units.update requires an id.",
                 )
             } else {
-                match serde_json::from_value::<prophet_admin_api::UpdateUnitRequest>(command.params) {
+                match serde_json::from_value::<prophet_admin_api::UpdateUnitRequest>(command.params)
+                {
                     Ok(request) => match prophet_admin_api::ProphetAdminApiClient::connect() {
                         Ok(client) => match client.update_unit(&id, &request).await {
                             Ok(unit) => ServerResponse::ok(command.id, unit),
@@ -7908,15 +8579,23 @@ async fn handle_text_message_with_role(
                 .unwrap_or_default()
                 .to_string();
             if unit_id.is_empty() {
-                ServerResponse::error(command.id, "invalid-params", "admin.units.members.add requires a unitId.")
+                ServerResponse::error(
+                    command.id,
+                    "invalid-params",
+                    "admin.units.members.add requires a unitId.",
+                )
             } else {
-                match serde_json::from_value::<prophet_admin_api::AddUnitMemberRequest>(command.params.clone()) {
+                match serde_json::from_value::<prophet_admin_api::AddUnitMemberRequest>(
+                    command.params.clone(),
+                ) {
                     Ok(request) => match prophet_admin_api::ProphetAdminApiClient::connect() {
                         Ok(client) => match client.add_unit_member(&unit_id, &request).await {
                             Ok(membership) => ServerResponse::ok(command.id, membership),
-                            Err(error) => {
-                                ServerResponse::error(command.id, "unit-member-add-failed", error.to_string())
-                            }
+                            Err(error) => ServerResponse::error(
+                                command.id,
+                                "unit-member-add-failed",
+                                error.to_string(),
+                            ),
                         },
                         Err(error) => ServerResponse::error(
                             command.id,
@@ -7924,7 +8603,9 @@ async fn handle_text_message_with_role(
                             error.to_string(),
                         ),
                     },
-                    Err(error) => ServerResponse::error(command.id, "invalid-params", error.to_string()),
+                    Err(error) => {
+                        ServerResponse::error(command.id, "invalid-params", error.to_string())
+                    }
                 }
             }
         }
@@ -7953,13 +8634,17 @@ async fn handle_text_message_with_role(
                         Ok(()) => {
                             ServerResponse::ok(command.id, serde_json::json!({ "deleted": true }))
                         }
-                        Err(error) => {
-                            ServerResponse::error(command.id, "unit-member-remove-failed", error.to_string())
-                        }
+                        Err(error) => ServerResponse::error(
+                            command.id,
+                            "unit-member-remove-failed",
+                            error.to_string(),
+                        ),
                     },
-                    Err(error) => {
-                        ServerResponse::error(command.id, "admin-connection-not-configured", error.to_string())
-                    }
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "admin-connection-not-configured",
+                        error.to_string(),
+                    ),
                 }
             }
         }
@@ -7971,15 +8656,23 @@ async fn handle_text_message_with_role(
                 .unwrap_or_default()
                 .to_string();
             if unit_id.is_empty() {
-                ServerResponse::error(command.id, "invalid-params", "admin.units.positions.create requires a unitId.")
+                ServerResponse::error(
+                    command.id,
+                    "invalid-params",
+                    "admin.units.positions.create requires a unitId.",
+                )
             } else {
-                match serde_json::from_value::<prophet_admin_api::CreateUnitPositionRequest>(command.params.clone()) {
+                match serde_json::from_value::<prophet_admin_api::CreateUnitPositionRequest>(
+                    command.params.clone(),
+                ) {
                     Ok(request) => match prophet_admin_api::ProphetAdminApiClient::connect() {
                         Ok(client) => match client.create_unit_position(&unit_id, &request).await {
                             Ok(position) => ServerResponse::ok(command.id, position),
-                            Err(error) => {
-                                ServerResponse::error(command.id, "unit-position-create-failed", error.to_string())
-                            }
+                            Err(error) => ServerResponse::error(
+                                command.id,
+                                "unit-position-create-failed",
+                                error.to_string(),
+                            ),
                         },
                         Err(error) => ServerResponse::error(
                             command.id,
@@ -7987,7 +8680,9 @@ async fn handle_text_message_with_role(
                             error.to_string(),
                         ),
                     },
-                    Err(error) => ServerResponse::error(command.id, "invalid-params", error.to_string()),
+                    Err(error) => {
+                        ServerResponse::error(command.id, "invalid-params", error.to_string())
+                    }
                 }
             }
         }
@@ -8016,13 +8711,17 @@ async fn handle_text_message_with_role(
                         Ok(()) => {
                             ServerResponse::ok(command.id, serde_json::json!({ "deleted": true }))
                         }
-                        Err(error) => {
-                            ServerResponse::error(command.id, "unit-position-delete-failed", error.to_string())
-                        }
+                        Err(error) => ServerResponse::error(
+                            command.id,
+                            "unit-position-delete-failed",
+                            error.to_string(),
+                        ),
                     },
-                    Err(error) => {
-                        ServerResponse::error(command.id, "admin-connection-not-configured", error.to_string())
-                    }
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "admin-connection-not-configured",
+                        error.to_string(),
+                    ),
                 }
             }
         }
@@ -8046,13 +8745,20 @@ async fn handle_text_message_with_role(
                     "admin.units.positions.assign requires a unitId and positionId.",
                 )
             } else {
-                match serde_json::from_value::<prophet_admin_api::AssignUnitPositionRequest>(command.params.clone()) {
+                match serde_json::from_value::<prophet_admin_api::AssignUnitPositionRequest>(
+                    command.params.clone(),
+                ) {
                     Ok(request) => match prophet_admin_api::ProphetAdminApiClient::connect() {
-                        Ok(client) => match client.assign_unit_position(&unit_id, &position_id, &request).await {
+                        Ok(client) => match client
+                            .assign_unit_position(&unit_id, &position_id, &request)
+                            .await
+                        {
                             Ok(assignment) => ServerResponse::ok(command.id, assignment),
-                            Err(error) => {
-                                ServerResponse::error(command.id, "unit-position-assign-failed", error.to_string())
-                            }
+                            Err(error) => ServerResponse::error(
+                                command.id,
+                                "unit-position-assign-failed",
+                                error.to_string(),
+                            ),
                         },
                         Err(error) => ServerResponse::error(
                             command.id,
@@ -8060,7 +8766,9 @@ async fn handle_text_message_with_role(
                             error.to_string(),
                         ),
                     },
-                    Err(error) => ServerResponse::error(command.id, "invalid-params", error.to_string()),
+                    Err(error) => {
+                        ServerResponse::error(command.id, "invalid-params", error.to_string())
+                    }
                 }
             }
         }
@@ -8091,24 +8799,33 @@ async fn handle_text_message_with_role(
                 )
             } else {
                 match prophet_admin_api::ProphetAdminApiClient::connect() {
-                    Ok(client) => match client.end_unit_position_assignment(&unit_id, &position_id, &assignment_id).await {
+                    Ok(client) => match client
+                        .end_unit_position_assignment(&unit_id, &position_id, &assignment_id)
+                        .await
+                    {
                         Ok(assignment) => ServerResponse::ok(command.id, assignment),
-                        Err(error) => {
-                            ServerResponse::error(command.id, "unit-position-assignment-end-failed", error.to_string())
-                        }
+                        Err(error) => ServerResponse::error(
+                            command.id,
+                            "unit-position-assignment-end-failed",
+                            error.to_string(),
+                        ),
                     },
-                    Err(error) => {
-                        ServerResponse::error(command.id, "admin-connection-not-configured", error.to_string())
-                    }
+                    Err(error) => ServerResponse::error(
+                        command.id,
+                        "admin-connection-not-configured",
+                        error.to_string(),
+                    ),
                 }
             }
         }
         "admin.locations.list" => match prophet_admin_api::ProphetAdminApiClient::connect() {
             Ok(client) => match client.list_locations().await {
                 Ok(locations) => ServerResponse::ok(command.id, locations),
-                Err(error) => {
-                    ServerResponse::error(command.id, "admin-locations-list-failed", error.to_string())
-                }
+                Err(error) => ServerResponse::error(
+                    command.id,
+                    "admin-locations-list-failed",
+                    error.to_string(),
+                ),
             },
             Err(error) => ServerResponse::error(
                 command.id,
@@ -8117,7 +8834,8 @@ async fn handle_text_message_with_role(
             ),
         },
         "admin.locations.create" => {
-            match serde_json::from_value::<prophet_admin_api::CreateLocationRequest>(command.params) {
+            match serde_json::from_value::<prophet_admin_api::CreateLocationRequest>(command.params)
+            {
                 Ok(request) => match prophet_admin_api::ProphetAdminApiClient::connect() {
                     Ok(client) => match client.create_location(&request).await {
                         Ok(location) => ServerResponse::ok(command.id, location),
@@ -8152,7 +8870,9 @@ async fn handle_text_message_with_role(
                     "admin.locations.update requires an id.",
                 )
             } else {
-                match serde_json::from_value::<prophet_admin_api::UpdateLocationRequest>(command.params) {
+                match serde_json::from_value::<prophet_admin_api::UpdateLocationRequest>(
+                    command.params,
+                ) {
                     Ok(request) => match prophet_admin_api::ProphetAdminApiClient::connect() {
                         Ok(client) => match client.update_location(&id, &request).await {
                             Ok(location) => ServerResponse::ok(command.id, location),
@@ -8221,7 +8941,8 @@ async fn handle_text_message_with_role(
             ),
         },
         "admin.team.create" => {
-            match serde_json::from_value::<prophet_admin_api::CreateTeamUserRequest>(command.params) {
+            match serde_json::from_value::<prophet_admin_api::CreateTeamUserRequest>(command.params)
+            {
                 Ok(request) => match prophet_admin_api::ProphetAdminApiClient::connect() {
                     Ok(client) => match client.create_team_user(&request).await {
                         Ok(user) => ServerResponse::ok(command.id, user),
@@ -8256,7 +8977,9 @@ async fn handle_text_message_with_role(
                     "admin.team.update requires an id.",
                 )
             } else {
-                match serde_json::from_value::<prophet_admin_api::UpdateTeamUserRequest>(command.params) {
+                match serde_json::from_value::<prophet_admin_api::UpdateTeamUserRequest>(
+                    command.params,
+                ) {
                     Ok(request) => match prophet_admin_api::ProphetAdminApiClient::connect() {
                         Ok(client) => match client.update_team_user(&id, &request).await {
                             Ok(user) => ServerResponse::ok(command.id, user),
@@ -8342,7 +9065,10 @@ async fn handle_text_message_with_role(
             };
             match decoded_bytes {
                 Ok(bytes) => match prophet_admin_api::ProphetAdminApiClient::connect() {
-                    Ok(client) => match client.upload_image(&folder, &file_name, &mime_type, bytes).await {
+                    Ok(client) => match client
+                        .upload_image(&folder, &file_name, &mime_type, bytes)
+                        .await
+                    {
                         Ok(uploaded) => ServerResponse::ok(command.id, uploaded),
                         Err(error) => ServerResponse::error(
                             command.id,
@@ -8356,7 +9082,9 @@ async fn handle_text_message_with_role(
                         error.to_string(),
                     ),
                 },
-                Err(error) => ServerResponse::error(command.id, "invalid-params", error.to_string()),
+                Err(error) => {
+                    ServerResponse::error(command.id, "invalid-params", error.to_string())
+                }
             }
         }
         "geocoding.search" => {
@@ -8374,8 +9102,16 @@ async fn handle_text_message_with_role(
             }
         }
         "geocoding.reverse" => {
-            let lat = command.params.get("lat").and_then(serde_json::Value::as_f64).unwrap_or_default();
-            let lng = command.params.get("lng").and_then(serde_json::Value::as_f64).unwrap_or_default();
+            let lat = command
+                .params
+                .get("lat")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_default();
+            let lng = command
+                .params
+                .get("lng")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or_default();
             match prophet_admin_api::geocode_reverse(lat, lng).await {
                 Ok(result) => ServerResponse::ok(command.id, result),
                 Err(error) => {
@@ -9377,6 +10113,80 @@ mod tests {
         assert!(!websocket_event_is_coalescible(
             "platformAccounts.oauth.callback"
         ));
+    }
+
+    #[tokio::test]
+    async fn websocket_read_only_queries_answer_while_a_stateful_command_is_in_flight() {
+        // The 0.9.44 owner incident: session.stop (which awaits the MP4
+        // export inline) starved preview.surface.status behind the serial
+        // dispatcher until the renderer's 5s budget expired. Read-only
+        // queries must overlap stateful commands.
+        let handler: WebSocketCommandHandler = std::sync::Arc::new(move |_state, text| {
+            Box::pin(async move {
+                let command: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if command["method"] == "session.stop" {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                ServerResponse::ok(command["id"].as_str().unwrap(), json!({}))
+            })
+        });
+        let (command_tx, command_rx) = mpsc::channel(WEBSOCKET_COMMAND_QUEUE_CAPACITY);
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(WEBSOCKET_RELIABLE_QUEUE_CAPACITY);
+        let transport = std::sync::Arc::new(WebSocketTransportMetrics::default());
+        let connection = transport.register_connection();
+        let command_metrics = connection.incoming_command_queue;
+        let reliable_metrics = connection.reliable_response_queue;
+        let (pressure_tx, _pressure_rx) = mpsc::channel(1);
+        let slow_pressure = WebSocketSlowPressureSignal::new(pressure_tx, transport.clone());
+        let dispatcher = tokio::spawn(run_websocket_command_dispatcher(
+            test_state(),
+            command_rx,
+            command_metrics.clone(),
+            outgoing_tx,
+            reliable_metrics.clone(),
+            slow_pressure,
+            handler,
+        ));
+
+        assert!(
+            send_tracked_websocket_item(
+                &command_tx,
+                &command_metrics,
+                json!({ "id": "stop", "method": "session.stop", "params": {} }).to_string(),
+            )
+            .await
+        );
+        for index in 0..3 {
+            assert!(
+                send_tracked_websocket_item(
+                    &command_tx,
+                    &command_metrics,
+                    json!({
+                        "id": format!("status-{index}"),
+                        "method": "preview.surface.status",
+                        "params": {}
+                    })
+                    .to_string(),
+                )
+                .await
+            );
+        }
+        drop(command_tx);
+        dispatcher.await.unwrap();
+
+        let mut response_order = Vec::new();
+        while let Some(Message::Text(text)) = outgoing_rx.recv().await {
+            reliable_metrics.record_dequeue_oldest();
+            let response: serde_json::Value = serde_json::from_str(&text).unwrap();
+            response_order.push(response["id"].as_str().unwrap().to_string());
+        }
+        assert_eq!(response_order.len(), 4);
+        // Every status query answered BEFORE the slow stateful command.
+        assert_eq!(
+            response_order.last().map(String::as_str),
+            Some("stop"),
+            "read-only queries must not queue behind session.stop: {response_order:?}"
+        );
     }
 
     #[tokio::test]

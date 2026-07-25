@@ -59,6 +59,7 @@ describe('workspace navigation', () => {
       ['E', 'events'],
       ['B', 'members'],
       ['L', 'alerts'],
+      ['T', 'livingText'],
       ['D', 'departments'],
       ['U', 'ai'],
       ['A', 'staffAccess'],

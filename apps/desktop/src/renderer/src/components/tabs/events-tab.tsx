@@ -196,7 +196,9 @@ function formFromEvent(event: AdminEvent): EventFormState {
   }
 }
 
-function parseRecurrenceRule(rule: string | null): { freq: 'weekly' | 'monthly'; interval: number } | null {
+function parseRecurrenceRule(
+  rule: string | null
+): { freq: 'weekly' | 'monthly'; interval: number } | null {
   if (!rule) return null
   try {
     const parsed = JSON.parse(rule) as { freq?: string; interval?: number }
@@ -489,7 +491,9 @@ export function EventsTab(): ReactElement {
                     isRecurring: true,
                     recurrenceFreq: form.recurrenceFreq,
                     recurrenceInterval: Number(form.recurrenceInterval) || 1,
-                    ...(form.recurrenceUntil ? { recurrenceUntil: fromDatetimeLocal(form.recurrenceUntil) } : {})
+                    ...(form.recurrenceUntil
+                      ? { recurrenceUntil: fromDatetimeLocal(form.recurrenceUntil) }
+                      : {})
                   }
                 : {})
             })
@@ -1107,12 +1111,9 @@ export function EventsTab(): ReactElement {
                         setForm((current) => ({ ...current, applyToSeries: checked === true }))
                       }
                     />
-                    <label
-                      className="text-sm text-foreground"
-                      htmlFor="event-apply-to-series"
-                    >
-                      Part of a recurring series. Apply these changes to every future occurrence
-                      too (dates stay per-occurrence).
+                    <label className="text-sm text-foreground" htmlFor="event-apply-to-series">
+                      Part of a recurring series. Apply these changes to every future occurrence too
+                      (dates stay per-occurrence).
                     </label>
                   </div>
                 </Field>

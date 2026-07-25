@@ -39,8 +39,10 @@ function extractYouTubeId(url: string): string | null {
   }
   if (host === 'youtube.com' || host === 'music.youtube.com') {
     if (parsed.pathname === '/watch') return parsed.searchParams.get('v')
-    if (parsed.pathname.startsWith('/embed/')) return parsed.pathname.slice('/embed/'.length) || null
-    if (parsed.pathname.startsWith('/shorts/')) return parsed.pathname.slice('/shorts/'.length) || null
+    if (parsed.pathname.startsWith('/embed/'))
+      return parsed.pathname.slice('/embed/'.length) || null
+    if (parsed.pathname.startsWith('/shorts/'))
+      return parsed.pathname.slice('/shorts/'.length) || null
   }
   return null
 }

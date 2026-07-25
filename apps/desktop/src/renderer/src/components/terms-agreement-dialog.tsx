@@ -2,7 +2,6 @@ import { type ReactElement, useCallback, useRef, useState } from 'react'
 
 import logoUrl from '@/assets/zemara-logo.png'
 import { Button } from '@/components/ui/button'
-import { Dialog, DialogContent } from '@/components/ui/dialog'
 
 // PLACEHOLDER — replace with the real Terms of Service / EULA before this
 // ships to anyone outside development. This text is not legal advice and
@@ -64,6 +63,8 @@ function downloadTermsText(): void {
  * First-run legal gate, modeled on the installer-style License Agreement
  * convention Apple's own dev tools use (Xcode, Icon Composer): icon +
  * title/subtitle, scrollable terms body, Save / Disagree / Agree footer.
+ * Rendered as the whole window content via GateSurface — the real app does
+ * not exist behind it, so there is no dimmed overlay or background leakage.
  *
  * Two behaviors that make this a real gate rather than a lookalike:
  * - Agree stays disabled until the user scrolls the terms to the bottom —
@@ -72,16 +73,10 @@ function downloadTermsText(): void {
  *   same way). Text short enough to need no scrolling counts as satisfied
  *   immediately.
  * - Disagree really quits the app (via the app:quit IPC channel) rather than
- *   just leaving the dialog open — matching how declining an installer's
- *   EULA cancels the install instead of pretending to continue.
+ *   just leaving the panel up — matching how declining an installer's EULA
+ *   cancels the install instead of pretending to continue.
  */
-export function TermsAgreementDialog({
-  open,
-  onAgree
-}: {
-  open: boolean
-  onAgree: () => void
-}): ReactElement {
+export function TermsAgreementPanel({ onAgree }: { onAgree: () => void }): ReactElement {
   const [scrolledToBottom, setScrolledToBottom] = useState(false)
   const [quitting, setQuitting] = useState(false)
   const viewportRef = useRef<HTMLDivElement | null>(null)
@@ -110,51 +105,46 @@ export function TermsAgreementDialog({
   }
 
   return (
-    <Dialog open={open} onOpenChange={() => {}}>
-      <DialogContent
-        className="flex max-h-[85vh] max-w-lg flex-col gap-4"
-        showCloseButton={false}
-        onEscapeKeyDown={(event) => event.preventDefault()}
-        onInteractOutside={(event) => event.preventDefault()}
+    <div className="flex min-h-0 w-full flex-1 flex-col gap-4">
+      <div className="flex items-start gap-3">
+        <img alt="" className="size-10 shrink-0 rounded-xl" src={logoUrl} />
+        <div className="flex flex-col gap-1">
+          <h2 className="text-base font-semibold text-foreground" id="zemara-terms-title">
+            Zemara Agreement
+          </h2>
+          <p className="text-sm text-muted-foreground">
+            You must agree to the terms below in order to use Zemara.
+          </p>
+        </div>
+      </div>
+
+      <div
+        className="min-h-0 flex-1 overflow-y-auto rounded-xl border bg-input/30"
+        ref={handleViewportRef}
+        onScroll={(event) => checkScrollPosition(event.currentTarget)}
       >
-        <div className="flex items-start gap-3">
-          <img alt="" className="size-10 shrink-0 rounded-xl" src={logoUrl} />
-          <div className="flex flex-col gap-1">
-            <h2 className="text-base font-semibold text-foreground">Zemara Agreement</h2>
-            <p className="text-sm text-muted-foreground">
-              You must agree to the terms below in order to use Zemara.
-            </p>
-          </div>
-        </div>
+        <pre className="p-4 font-sans text-xs leading-relaxed whitespace-pre-wrap text-muted-foreground">
+          {TERMS_TEXT}
+        </pre>
+      </div>
 
-        <div
-          className="h-80 overflow-y-auto rounded-xl border bg-input/30"
-          ref={handleViewportRef}
-          onScroll={(event) => checkScrollPosition(event.currentTarget)}
-        >
-          <pre className="whitespace-pre-wrap p-4 font-sans text-xs leading-relaxed text-muted-foreground">
-            {TERMS_TEXT}
-          </pre>
-        </div>
+      {!scrolledToBottom ? (
+        <p className="text-xs text-muted-foreground">Scroll to the bottom to enable Agree.</p>
+      ) : null}
 
-        {!scrolledToBottom ? (
-          <p className="text-xs text-muted-foreground">Scroll to the bottom to enable Agree.</p>
-        ) : null}
-
-        <div className="flex items-center justify-between gap-2">
-          <Button disabled={quitting} size="sm" variant="ghost" onClick={downloadTermsText}>
-            Save…
+      <div className="mt-auto flex items-center justify-between gap-2">
+        <Button disabled={quitting} size="sm" variant="ghost" onClick={downloadTermsText}>
+          Save…
+        </Button>
+        <div className="flex gap-2">
+          <Button disabled={quitting} size="sm" variant="outline" onClick={handleDisagree}>
+            Disagree
           </Button>
-          <div className="flex gap-2">
-            <Button disabled={quitting} size="sm" variant="outline" onClick={handleDisagree}>
-              Disagree
-            </Button>
-            <Button disabled={quitting || !scrolledToBottom} size="sm" onClick={onAgree}>
-              Agree
-            </Button>
-          </div>
+          <Button disabled={quitting || !scrolledToBottom} size="sm" onClick={onAgree}>
+            Agree
+          </Button>
         </div>
-      </DialogContent>
-    </Dialog>
+      </div>
+    </div>
   )
 }

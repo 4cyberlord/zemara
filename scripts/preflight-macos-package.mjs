@@ -19,6 +19,16 @@ const inputs = [
     path: join(repoRoot, 'target', 'release', 'videorc-backend'),
     remedy: 'pnpm package:backend:macos'
   },
+  // sherpa-onnx local speech engine — the backend links these @rpath and
+  // aborts at launch when they are missing from the bundle.
+  {
+    path: join(repoRoot, 'target', 'release', 'libonnxruntime.1.17.1.dylib'),
+    remedy: 'pnpm package:backend:macos'
+  },
+  {
+    path: join(repoRoot, 'target', 'release', 'libsherpa-onnx-c-api.dylib'),
+    remedy: 'pnpm package:backend:macos'
+  },
   {
     path: join(repoRoot, 'target', 'release', 'native_preview_host_helper'),
     remedy: 'pnpm package:backend:macos'

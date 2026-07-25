@@ -217,4 +217,30 @@ describe('buildRecordingStudioGateSteps', () => {
     )
     assert.match(source, /await resolveFinalRecordingPath\(\{/)
   })
+
+  it('resolves finalized recordings in both Windows live-audio recording flows', () => {
+    const source = readFileSync(
+      new URL('../smoke-windows-live-audio-controls-app.mjs', import.meta.url),
+      'utf8'
+    )
+    const scenarioFlow = source.slice(
+      source.indexOf('async function runScenario'),
+      source.indexOf('async function applyAndHold')
+    )
+    const stopRaceFlow = source.slice(
+      source.indexOf('async function runStopRace'),
+      source.indexOf('function sessionParams')
+    )
+
+    assert.match(
+      source,
+      /import \{ resolveFinalRecordingPath \} from '.\/lib\/final-recording-path\.mjs'/
+    )
+    for (const flow of [scenarioFlow, stopRaceFlow]) {
+      assert.match(flow, /await resolveFinalRecordingPath\(\{[\s\S]*?started,[\s\S]*?stopped,/)
+      assert.match(flow, /recordingStatusEvents,[\s\S]*?healthEvents,[\s\S]*?stopRequestedAt,[\s\S]*?timeoutMs/)
+    }
+    assert.match(source, /recordingStatusEvents\.push\(\{ \.\.\.message\.payload, receivedAt \}\)/)
+    assert.match(source, /healthEvents\.push\(\{ \.\.\.message\.payload, receivedAt \}\)/)
+  })
 })

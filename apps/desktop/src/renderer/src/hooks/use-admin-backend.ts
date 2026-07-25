@@ -5,6 +5,7 @@ import type {
   AdminConnection,
   AdminConnectionTestResult,
   AdminEvent,
+  AdminIdentity,
   AdminMember,
   AdminMemberInput,
   AdminRegisterResult,
@@ -29,13 +30,18 @@ import type {
   LivingTextAvailableTranslation,
   LivingTextBook,
   LivingTextResolvedCitation,
+  LivingTextSearchHit,
   LivingTextSyncSummary,
   LivingTextTranslation,
   LivingTextVerse,
+  LivingTextOutputVerse,
+  LivingTextOutputTheme,
   Location,
   ManualCheckInInput,
   MembersQuery,
   MembersStats,
+  NdiConfig,
+  NdiStatus,
   NotificationCampaign,
   OrganizationalUnit,
   OrganizationalUnitMembership,
@@ -59,6 +65,12 @@ import type {
 // dependency on the capture/recording state machine that hook orchestrates,
 // and BackendClient opens its own WebSocket, so a second lightweight
 // connection is the lower-risk, single-responsibility choice here.
+
+export interface LivingTextQueueItem {
+  id: string
+  verse: LivingTextOutputVerse
+}
+
 export type UseAdminBackend = {
   connection: AdminConnection | null
   connectionLoading: boolean
@@ -74,6 +86,21 @@ export type UseAdminBackend = {
     ownerEmail: string,
     ownerPassword: string
   ) => Promise<AdminRegisterResult>
+  /** The signed-in church staff session — who is at this desk and which
+   *  church they belong to. Null when signed out. */
+  identity: AdminIdentity | null
+  /** True until the first identity check completes — gates must wait for
+   *  this before deciding to show a sign-in screen, or every launch would
+   *  flash the gate before the stored session loads. */
+  identityLoading: boolean
+  refreshIdentity: () => Promise<void>
+  signIn: (params: {
+    baseUrl?: string
+    email: string
+    password: string
+    organization?: string
+  }) => Promise<AdminIdentity>
+  signOut: () => Promise<void>
   sermons: AdminSermon[]
   sermonsLoading: boolean
   sermonsError: string | null
@@ -154,7 +181,10 @@ export type UseAdminBackend = {
   deleteUnit: (id: string) => Promise<void>
   addUnitMember: (unitId: string, memberId: string) => Promise<OrganizationalUnitMembership>
   removeUnitMember: (unitId: string, membershipId: string) => Promise<void>
-  createUnitPosition: (unitId: string, input: CreateUnitPositionInput) => Promise<OrganizationalUnitPosition>
+  createUnitPosition: (
+    unitId: string,
+    input: CreateUnitPositionInput
+  ) => Promise<OrganizationalUnitPosition>
   deleteUnitPosition: (unitId: string, positionId: string) => Promise<void>
   assignUnitPosition: (
     unitId: string,
@@ -199,6 +229,206 @@ export type UseAdminBackend = {
     translationCode: string,
     text: string
   ) => Promise<LivingTextResolvedCitation[]>
+  searchLivingText: (
+    translationCode: string,
+    query: string,
+    book?: string,
+    limit?: number
+  ) => Promise<LivingTextSearchHit[]>
+  crossRefLivingText: (translationCode: string, referenceText: string) => Promise<LivingTextVerse[]>
+  livingTextQueue: LivingTextQueueItem[]
+  setLivingTextQueue: (
+    queue: LivingTextQueueItem[] | ((prev: LivingTextQueueItem[]) => LivingTextQueueItem[])
+  ) => void
+  activeTranslationCode: string
+  setActiveTranslationCode: (code: string) => void
+  /** Preferred translation for detection/browse; '' means fall back to the app default. */
+  livingTextDefaultTranslationCode: string
+  setLivingTextDefaultTranslationCode: (code: string) => void
+  /** Citations below this confidence land in the detection feed only — no queue/auto-present. */
+  livingTextConfidenceThreshold: number
+  setLivingTextConfidenceThreshold: (value: number) => void
+  /** Window in ms during which repeat detections of the same reference are dropped. */
+  livingTextDetectionCooldownMs: number
+  setLivingTextDetectionCooldownMs: (value: number) => void
+  isLiveDetectionEnabled: boolean
+  setLiveDetectionEnabled: (enabled: boolean) => void
+  isAutoPresentEnabled: boolean
+  setAutoPresentEnabled: (enabled: boolean) => void
+  isLiveSyncEnabled: boolean
+  setLiveSyncEnabled: (enabled: boolean) => void
+  isReadingModeEnabled: boolean
+  setReadingModeEnabled: (enabled: boolean) => void
+  livingTextLiveVerse: LivingTextOutputVerse | null
+  setLivingTextLiveVerse: (verse: LivingTextOutputVerse | null) => void
+  livingTextLiveVerseAt: number | null
+  livingTextOutputTheme: LivingTextOutputTheme
+  setLivingTextOutputTheme: (
+    theme: LivingTextOutputTheme | ((prev: LivingTextOutputTheme) => LivingTextOutputTheme)
+  ) => void
+  livingTextDetectionFeed: LivingTextDetectionFeedItem[]
+  addLivingTextDetection: (item: LivingTextDetectionFeedItem) => void
+  clearLivingTextDetectionFeed: () => void
+  /** Latest live-detection pass with every candidate weighed — the Context Result panel. */
+  livingTextContextResult: LivingTextContextResult | null
+  setLivingTextContextResult: (result: LivingTextContextResult | null) => void
+  livingTextSession: LivingTextSessionEntry[]
+  addLivingTextSessionEntry: (entry: LivingTextSessionEntry) => void
+  removeLivingTextSessionEntry: (id: string) => void
+  clearLivingTextSession: () => void
+  // --- NDI broadcast output ---
+  ndiConfig: NdiConfig
+  setNdiConfig: (config: NdiConfig | ((prev: NdiConfig) => NdiConfig)) => void
+  ndiStatus: NdiStatus | null
+  /** Last start/stop/frame failure — surfaced in the Broadcast dialog. */
+  ndiError: string | null
+  ndiBusy: boolean
+  ndiStart: () => Promise<void>
+  ndiStop: () => Promise<void>
+  ndiRefreshStatus: () => Promise<void>
+  /** Push one RGBA frame; resolves with the backend frame counter. */
+  ndiSendFrame: (width: number, height: number, rgbaBase64: string) => Promise<number>
+}
+
+export interface LivingTextDetectionFeedItem {
+  id: string
+  reference: string
+  text: string
+  matchType: string
+  source: 'direct' | 'chapter' | 'semantic' | 'auto'
+  confidence: number
+  detectedAt: number
+}
+
+/** One candidate the detector weighed for a heard line — resolved or not. */
+export interface LivingTextContextCandidate {
+  reference: string
+  /** Joined verse text; empty when the reference is not in the cached translation. */
+  text: string
+  matchType: string
+  confidence: number
+  resolved: boolean
+  /** The transcript fragment this candidate was matched from. */
+  sourceText: string
+}
+
+/**
+ * The latest live-detection pass: every candidate the detector produced for
+ * the most recent heard line that matched anything, best first. The threshold
+ * only gates queue/auto-present — the panel shows all of them, pewbeam-style.
+ */
+export interface LivingTextContextResult {
+  id: string
+  /** The settled caption line that triggered this pass. */
+  heardText: string
+  candidates: LivingTextContextCandidate[]
+  detectedAt: number
+}
+
+/** One entry in the session transcript — records every verse presented during the session. */
+export interface LivingTextSessionEntry {
+  id: string
+  reference: string
+  text: string
+  /** Unix ms timestamp when this verse was presented. */
+  presentedAt: number
+  /** How the verse reached the output — manual browse, search, detection, queue. */
+  source: 'browse' | 'search' | 'crossref' | 'detection' | 'queue' | 'manual'
+}
+
+const THEME_STORAGE_KEY = 'videorc.livingText.outputTheme'
+const CONFIDENCE_THRESHOLD_STORAGE_KEY = 'videorc.livingText.confidenceThreshold'
+const DETECTION_COOLDOWN_STORAGE_KEY = 'videorc.livingText.detectionCooldownMs'
+const DEFAULT_TRANSLATION_STORAGE_KEY = 'videorc.livingText.defaultTranslationCode'
+const ACTIVE_TRANSLATION_STORAGE_KEY = 'videorc.livingText.activeTranslationCode'
+const DEFAULT_THEME: LivingTextOutputTheme = {
+  // Background
+  backgroundType: 'solid',
+  backgroundColor: '#000000',
+  gradientAngle: 135,
+  gradientColorStart: '#0f0c29',
+  gradientColorEnd: '#302b63',
+  backgroundImagePath: null,
+  backgroundImageOpacity: 0.5,
+  // Verse text
+  textColor: '#ffffff',
+  fontSize: 56,
+  fontFamily: 'system-ui, -apple-system, sans-serif',
+  fontWeight: 600,
+  lineHeight: 1.35,
+  letterSpacing: 0,
+  textAlign: 'center',
+  textShadowBlur: 0,
+  textShadowX: 0,
+  textShadowY: 2,
+  textShadowColor: 'rgba(0,0,0,0.6)',
+  textStrokeWidth: 0,
+  textStrokeColor: '#000000',
+  // Reference line
+  referenceColor: '#f5c451',
+  referenceAlign: 'center',
+  referenceFontSize: 0,
+  // Layout
+  verticalPosition: 'center',
+  horizontalPaddingPct: 8,
+  maxWidthPct: 80,
+  // Output
+  displayMode: 'fullscreen',
+  resolutionWidth: 1920,
+  resolutionHeight: 1080
+}
+function loadStoredTheme(): LivingTextOutputTheme {
+  try {
+    if (typeof window === 'undefined') return DEFAULT_THEME
+    const raw = localStorage.getItem(THEME_STORAGE_KEY)
+    if (!raw) return DEFAULT_THEME
+    return { ...DEFAULT_THEME, ...(JSON.parse(raw) as Partial<LivingTextOutputTheme>) }
+  } catch {
+    return DEFAULT_THEME
+  }
+}
+
+const NDI_CONFIG_STORAGE_KEY = 'videorc.ndi.config'
+const DEFAULT_NDI_CONFIG: NdiConfig = {
+  sourceName: 'Zemara Bible Verse',
+  resolution: 'r1080p',
+  frameRate: 'fps30',
+  alphaMode: 'straightAlpha'
+}
+function loadStoredNdiConfig(): NdiConfig {
+  try {
+    if (typeof window === 'undefined') return DEFAULT_NDI_CONFIG
+    const raw = localStorage.getItem(NDI_CONFIG_STORAGE_KEY)
+    if (!raw) return DEFAULT_NDI_CONFIG
+    return { ...DEFAULT_NDI_CONFIG, ...(JSON.parse(raw) as Partial<NdiConfig>) }
+  } catch {
+    return DEFAULT_NDI_CONFIG
+  }
+}
+
+/** Persisted numeric setting — falls back when missing/unparseable, clamps to range. */
+function loadStoredNumber(key: string, fallback: number, min: number, max: number): number {
+  try {
+    if (typeof window === 'undefined') return fallback
+    const raw = localStorage.getItem(key)
+    if (raw === null) return fallback
+    const value = Number(raw)
+    if (!Number.isFinite(value)) return fallback
+    return Math.min(max, Math.max(min, value))
+  } catch {
+    return fallback
+  }
+}
+
+/** Persisted string setting — an empty stored value means "unset" and falls back. */
+function loadStoredString(key: string, fallback: string): string {
+  try {
+    if (typeof window === 'undefined') return fallback
+    const raw = localStorage.getItem(key)
+    return raw !== null && raw.trim() !== '' ? raw : fallback
+  } catch {
+    return fallback
+  }
 }
 
 export function useAdminBackend(): UseAdminBackend {
@@ -208,6 +438,8 @@ export function useAdminBackend(): UseAdminBackend {
   const [connection, setConnection] = useState<AdminConnection | null>(null)
   const [connectionLoading, setConnectionLoading] = useState(true)
   const [connectionError, setConnectionError] = useState<string | null>(null)
+  const [identity, setIdentity] = useState<AdminIdentity | null>(null)
+  const [identityLoading, setIdentityLoading] = useState(true)
 
   const [sermons, setSermons] = useState<AdminSermon[]>([])
   const [sermonsLoading, setSermonsLoading] = useState(false)
@@ -216,12 +448,225 @@ export function useAdminBackend(): UseAdminBackend {
   const [livingTextBooks, setLivingTextBooks] = useState<LivingTextBook[]>([])
   const [livingTextTranslations, setLivingTextTranslations] = useState<LivingTextTranslation[]>([])
   const [livingTextTranslationsLoading, setLivingTextTranslationsLoading] = useState(false)
-  const [livingTextTranslationsError, setLivingTextTranslationsError] = useState<string | null>(null)
+  const [livingTextTranslationsError, setLivingTextTranslationsError] = useState<string | null>(
+    null
+  )
   const [livingTextAvailableTranslations, setLivingTextAvailableTranslations] = useState<
     LivingTextAvailableTranslation[]
   >([])
   const [livingTextAvailableTranslationsLoading, setLivingTextAvailableTranslationsLoading] =
     useState(false)
+
+  const [livingTextQueue, setLivingTextQueue] = useState<LivingTextQueueItem[]>([])
+  const [livingTextDefaultTranslationCode, setLivingTextDefaultTranslationCode] = useState<string>(
+    () => loadStoredString(DEFAULT_TRANSLATION_STORAGE_KEY, '')
+  )
+  // The active translation persists across launches (pewbeam parity): the
+  // operator's last pick wins, then the stored church default, then 'NIV'.
+  // An empty stored string counts as unset.
+  const [activeTranslationCode, setActiveTranslationCodeRaw] = useState<string>(() => {
+    const active = loadStoredString(ACTIVE_TRANSLATION_STORAGE_KEY, '')
+    if (active) return active
+    const storedDefault = loadStoredString(DEFAULT_TRANSLATION_STORAGE_KEY, '')
+    return storedDefault || 'NIV'
+  })
+  const setActiveTranslationCode = useCallback((code: string) => {
+    setActiveTranslationCodeRaw(code)
+    try {
+      localStorage.setItem(ACTIVE_TRANSLATION_STORAGE_KEY, code)
+    } catch {
+      // storage blocked — the in-memory pick still applies
+    }
+  }, [])
+  const [livingTextConfidenceThreshold, setLivingTextConfidenceThreshold] = useState<number>(() =>
+    loadStoredNumber(CONFIDENCE_THRESHOLD_STORAGE_KEY, 0.8, 0, 1)
+  )
+  const [livingTextDetectionCooldownMs, setLivingTextDetectionCooldownMs] = useState<number>(() =>
+    loadStoredNumber(DETECTION_COOLDOWN_STORAGE_KEY, 15_000, 0, 600_000)
+  )
+  const [isLiveDetectionEnabled, setLiveDetectionEnabled] = useState(false)
+  const [isAutoPresentEnabled, setAutoPresentEnabled] = useState(false)
+  const [isLiveSyncEnabled, setLiveSyncEnabled] = useState<boolean>(() => {
+    try {
+      const stored = localStorage.getItem('videorc.livingText.isLiveSyncEnabled')
+      return stored !== null ? stored === 'true' : true
+    } catch {
+      return true
+    }
+  })
+  const [isReadingModeEnabled, setReadingModeEnabled] = useState<boolean>(() => {
+    try {
+      const stored = localStorage.getItem('videorc.livingText.isReadingModeEnabled')
+      return stored !== null ? stored === 'true' : false
+    } catch {
+      return false
+    }
+  })
+
+  useEffect(() => {
+    localStorage.setItem('videorc.livingText.isLiveSyncEnabled', String(isLiveSyncEnabled))
+  }, [isLiveSyncEnabled])
+
+  useEffect(() => {
+    localStorage.setItem('videorc.livingText.isReadingModeEnabled', String(isReadingModeEnabled))
+  }, [isReadingModeEnabled])
+
+  useEffect(() => {
+    localStorage.setItem(DEFAULT_TRANSLATION_STORAGE_KEY, livingTextDefaultTranslationCode)
+  }, [livingTextDefaultTranslationCode])
+
+  useEffect(() => {
+    localStorage.setItem(CONFIDENCE_THRESHOLD_STORAGE_KEY, String(livingTextConfidenceThreshold))
+  }, [livingTextConfidenceThreshold])
+
+  useEffect(() => {
+    localStorage.setItem(DETECTION_COOLDOWN_STORAGE_KEY, String(livingTextDetectionCooldownMs))
+  }, [livingTextDetectionCooldownMs])
+
+  // addLivingTextDetection's dedupe runs inside a setState updater, so it
+  // reads the cooldown through a ref instead of closing over stale state.
+  const livingTextDetectionCooldownMsRef = useRef(livingTextDetectionCooldownMs)
+  useEffect(() => {
+    livingTextDetectionCooldownMsRef.current = livingTextDetectionCooldownMs
+  }, [livingTextDetectionCooldownMs])
+
+  const [livingTextLiveVerse, setLivingTextLiveVerseRaw] = useState<LivingTextOutputVerse | null>(
+    null
+  )
+  const [livingTextLiveVerseAt, setLivingTextLiveVerseAt] = useState<number | null>(null)
+  const [livingTextOutputTheme, setLivingTextOutputTheme] =
+    useState<LivingTextOutputTheme>(loadStoredTheme)
+  const [livingTextDetectionFeed, setLivingTextDetectionFeed] = useState<
+    LivingTextDetectionFeedItem[]
+  >([])
+  const [livingTextContextResult, setLivingTextContextResult] =
+    useState<LivingTextContextResult | null>(null)
+  const [livingTextSession, setLivingTextSession] = useState<LivingTextSessionEntry[]>([])
+
+  const setLivingTextLiveVerse = useCallback((verse: LivingTextOutputVerse | null) => {
+    setLivingTextLiveVerseRaw(verse)
+    setLivingTextLiveVerseAt(verse ? Date.now() : null)
+  }, [])
+
+  const addLivingTextDetection = useCallback((item: LivingTextDetectionFeedItem) => {
+    setLivingTextDetectionFeed((current) => {
+      // Drop near-duplicate detections of the same reference — live caption
+      // lines often repeat a citation as the speaker settles on it.
+      const recent = current.find(
+        (entry) =>
+          entry.reference === item.reference &&
+          item.detectedAt - entry.detectedAt < livingTextDetectionCooldownMsRef.current
+      )
+      if (recent) return current
+      return [item, ...current].slice(0, 50)
+    })
+  }, [])
+
+  const clearLivingTextDetectionFeed = useCallback(() => {
+    setLivingTextDetectionFeed([])
+  }, [])
+
+  const addLivingTextSessionEntry = useCallback((entry: LivingTextSessionEntry) => {
+    setLivingTextSession((current) => [entry, ...current].slice(0, 200))
+  }, [])
+
+  const removeLivingTextSessionEntry = useCallback((id: string) => {
+    setLivingTextSession((current) => current.filter((entry) => entry.id !== id))
+  }, [])
+
+  const clearLivingTextSession = useCallback(() => {
+    setLivingTextSession([])
+  }, [])
+
+  // Sync theme + live verse changes to the output window. Live Sync can be
+  // switched off to freeze the current output while preparing the next verse.
+  useEffect(() => {
+    if (!isLiveSyncEnabled) return
+    if (typeof window !== 'undefined' && window.videorc) {
+      void window.videorc.pushLivingTextOutput?.({
+        theme: livingTextOutputTheme,
+        verse: livingTextLiveVerse
+      })
+    }
+  }, [livingTextOutputTheme, livingTextLiveVerse, isLiveSyncEnabled])
+
+  // --- NDI broadcast output -------------------------------------------------
+  // Config persists locally (pewbeam's resets every launch — ours does not);
+  // the session itself lives in the Rust backend and is healed via ndi.status.
+  const [ndiConfig, setNdiConfigRaw] = useState<NdiConfig>(loadStoredNdiConfig)
+  const [ndiStatus, setNdiStatus] = useState<NdiStatus | null>(null)
+  const [ndiError, setNdiError] = useState<string | null>(null)
+  const [ndiBusy, setNdiBusy] = useState(false)
+
+  const setNdiConfig = useCallback((next: NdiConfig | ((prev: NdiConfig) => NdiConfig)) => {
+    setNdiConfigRaw((prev) => {
+      const resolved = typeof next === 'function' ? next(prev) : next
+      try {
+        localStorage.setItem(NDI_CONFIG_STORAGE_KEY, JSON.stringify(resolved))
+      } catch {
+        // storage full/blocked — the in-memory config still applies
+      }
+      return resolved
+    })
+  }, [])
+
+  const ndiStart = useCallback(async (): Promise<void> => {
+    const client = clientRef.current
+    if (!client) throw new Error('Backend is not connected yet.')
+    setNdiBusy(true)
+    setNdiError(null)
+    try {
+      setNdiStatus(await client.requestTyped('ndi.start', ndiConfig))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setNdiError(message)
+      throw error
+    } finally {
+      setNdiBusy(false)
+    }
+  }, [ndiConfig])
+
+  const ndiStop = useCallback(async (): Promise<void> => {
+    const client = clientRef.current
+    if (!client) throw new Error('Backend is not connected yet.')
+    setNdiBusy(true)
+    setNdiError(null)
+    try {
+      setNdiStatus(await client.requestTyped('ndi.stop'))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      setNdiError(message)
+      throw error
+    } finally {
+      setNdiBusy(false)
+    }
+  }, [])
+
+  const ndiRefreshStatus = useCallback(async (): Promise<void> => {
+    const client = clientRef.current
+    if (!client) return
+    try {
+      setNdiStatus(await client.requestTyped('ndi.status'))
+    } catch {
+      // Backend unreachable — leave the previous status in place.
+    }
+  }, [])
+
+  const ndiSendFrame = useCallback(
+    async (width: number, height: number, rgbaBase64: string): Promise<number> => {
+      const client = clientRef.current
+      if (!client) throw new Error('Backend is not connected yet.')
+      const ack = await client.requestTyped('ndi.frame', { width, height, rgbaBase64 })
+      return ack.frameCount
+    },
+    []
+  )
+
+  // Heal local state with the backend session on connect (e.g. after a
+  // renderer reload while the backend kept broadcasting).
+  useEffect(() => {
+    void ndiRefreshStatus()
+  }, [ndiRefreshStatus, ready])
 
   const [series, setSeries] = useState<AdminSermonSeries[]>([])
   const [seriesLoading, setSeriesLoading] = useState(false)
@@ -316,6 +761,46 @@ export function useAdminBackend(): UseAdminBackend {
     if (ready) void refreshConnection()
   }, [ready, refreshConnection])
 
+  const refreshIdentity = useCallback(async (): Promise<void> => {
+    const client = clientRef.current
+    if (!client) return
+    try {
+      setIdentity(await client.requestTyped('admin.auth.get'))
+    } catch {
+      // A corrupt/legacy snapshot must not break the app — treat as signed out.
+      setIdentity(null)
+    } finally {
+      setIdentityLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (ready) void refreshIdentity()
+  }, [ready, refreshIdentity])
+
+  const signIn = useCallback(
+    async (params: {
+      baseUrl?: string
+      email: string
+      password: string
+      organization?: string
+    }): Promise<AdminIdentity> => {
+      const client = clientRef.current
+      if (!client) throw new Error('Backend is not connected yet.')
+      const next = await client.requestTyped('admin.auth.login', params)
+      setIdentity(next)
+      return next
+    },
+    []
+  )
+
+  const signOut = useCallback(async (): Promise<void> => {
+    const client = clientRef.current
+    if (!client) throw new Error('Backend is not connected yet.')
+    await client.requestTyped('admin.auth.logout')
+    setIdentity(null)
+  }, [])
+
   const saveConnection = useCallback(
     async (baseUrl: string, apiKey?: string): Promise<AdminConnection> => {
       const client = clientRef.current
@@ -372,7 +857,9 @@ export function useAdminBackend(): UseAdminBackend {
       // The new church now has a real API key — store it immediately so the
       // rest of the app (which reads Settings > Database) picks it up
       // without the user having to paste it in a second time.
-      setConnection(await client.requestTyped('admin.connection.set', { baseUrl, apiKey: result.apiKey }))
+      setConnection(
+        await client.requestTyped('admin.connection.set', { baseUrl, apiKey: result.apiKey })
+      )
       return result
     },
     []
@@ -403,7 +890,9 @@ export function useAdminBackend(): UseAdminBackend {
     if (!client) return
     setLivingTextAvailableTranslationsLoading(true)
     try {
-      setLivingTextAvailableTranslations(await client.requestTyped('livingText.availableTranslations.list'))
+      setLivingTextAvailableTranslations(
+        await client.requestTyped('livingText.availableTranslations.list')
+      )
     } finally {
       setLivingTextAvailableTranslationsLoading(false)
     }
@@ -434,6 +923,29 @@ export function useAdminBackend(): UseAdminBackend {
       const client = clientRef.current
       if (!client) throw new Error('Backend is not connected yet.')
       return client.requestTyped('livingText.detect', { translationCode, text })
+    },
+    []
+  )
+
+  const searchLivingText = useCallback(
+    async (
+      translationCode: string,
+      query: string,
+      book?: string,
+      limit?: number
+    ): Promise<LivingTextSearchHit[]> => {
+      const client = clientRef.current
+      if (!client) throw new Error('Backend is not connected yet.')
+      return client.requestTyped('livingText.search', { translationCode, query, book, limit })
+    },
+    []
+  )
+
+  const crossRefLivingText = useCallback(
+    async (translationCode: string, referenceText: string): Promise<LivingTextVerse[]> => {
+      const client = clientRef.current
+      if (!client) throw new Error('Backend is not connected yet.')
+      return client.requestTyped('livingText.crossRef', { translationCode, referenceText })
     },
     []
   )
@@ -804,11 +1316,14 @@ export function useAdminBackend(): UseAdminBackend {
     []
   )
 
-  const deleteAttendanceRecord = useCallback(async (eventId: string, recordId: string): Promise<void> => {
-    const client = clientRef.current
-    if (!client) throw new Error('Backend is not connected yet.')
-    await client.requestTyped('admin.attendance.delete', { eventId, recordId })
-  }, [])
+  const deleteAttendanceRecord = useCallback(
+    async (eventId: string, recordId: string): Promise<void> => {
+      const client = clientRef.current
+      if (!client) throw new Error('Backend is not connected yet.')
+      await client.requestTyped('admin.attendance.delete', { eventId, recordId })
+    },
+    []
+  )
 
   const refreshUnits = useCallback(async (): Promise<void> => {
     const client = clientRef.current
@@ -865,11 +1380,14 @@ export function useAdminBackend(): UseAdminBackend {
     []
   )
 
-  const removeUnitMember = useCallback(async (unitId: string, membershipId: string): Promise<void> => {
-    const client = clientRef.current
-    if (!client) throw new Error('Backend is not connected yet.')
-    await client.requestTyped('admin.units.members.remove', { unitId, membershipId })
-  }, [])
+  const removeUnitMember = useCallback(
+    async (unitId: string, membershipId: string): Promise<void> => {
+      const client = clientRef.current
+      if (!client) throw new Error('Backend is not connected yet.')
+      await client.requestTyped('admin.units.members.remove', { unitId, membershipId })
+    },
+    []
+  )
 
   const createUnitPosition = useCallback(
     async (unitId: string, input: CreateUnitPositionInput): Promise<OrganizationalUnitPosition> => {
@@ -880,11 +1398,14 @@ export function useAdminBackend(): UseAdminBackend {
     []
   )
 
-  const deleteUnitPosition = useCallback(async (unitId: string, positionId: string): Promise<void> => {
-    const client = clientRef.current
-    if (!client) throw new Error('Backend is not connected yet.')
-    await client.requestTyped('admin.units.positions.delete', { unitId, positionId })
-  }, [])
+  const deleteUnitPosition = useCallback(
+    async (unitId: string, positionId: string): Promise<void> => {
+      const client = clientRef.current
+      if (!client) throw new Error('Backend is not connected yet.')
+      await client.requestTyped('admin.units.positions.delete', { unitId, positionId })
+    },
+    []
+  )
 
   const assignUnitPosition = useCallback(
     async (
@@ -1026,6 +1547,11 @@ export function useAdminBackend(): UseAdminBackend {
     clearConnection,
     testConnection,
     registerOrganization,
+    identity,
+    identityLoading,
+    refreshIdentity,
+    signIn,
+    signOut,
     livingTextBooks,
     loadLivingTextBooks,
     livingTextTranslations,
@@ -1038,6 +1564,49 @@ export function useAdminBackend(): UseAdminBackend {
     syncLivingTextTranslation,
     getLivingTextChapter,
     detectLivingTextCitations,
+    searchLivingText,
+    crossRefLivingText,
+    livingTextQueue,
+    setLivingTextQueue,
+    activeTranslationCode,
+    setActiveTranslationCode,
+    livingTextDefaultTranslationCode,
+    setLivingTextDefaultTranslationCode,
+    livingTextConfidenceThreshold,
+    setLivingTextConfidenceThreshold,
+    livingTextDetectionCooldownMs,
+    setLivingTextDetectionCooldownMs,
+    isLiveDetectionEnabled,
+    setLiveDetectionEnabled,
+    isAutoPresentEnabled,
+    setAutoPresentEnabled,
+    isLiveSyncEnabled,
+    setLiveSyncEnabled,
+    isReadingModeEnabled,
+    setReadingModeEnabled,
+    livingTextLiveVerse,
+    setLivingTextLiveVerse,
+    livingTextLiveVerseAt,
+    livingTextOutputTheme,
+    setLivingTextOutputTheme,
+    livingTextDetectionFeed,
+    addLivingTextDetection,
+    clearLivingTextDetectionFeed,
+    livingTextContextResult,
+    setLivingTextContextResult,
+    livingTextSession,
+    addLivingTextSessionEntry,
+    removeLivingTextSessionEntry,
+    clearLivingTextSession,
+    ndiConfig,
+    setNdiConfig,
+    ndiStatus,
+    ndiError,
+    ndiBusy,
+    ndiStart,
+    ndiStop,
+    ndiRefreshStatus,
+    ndiSendFrame,
     sermons,
     sermonsLoading,
     sermonsError,

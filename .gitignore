@@ -54,3 +54,12 @@ apps/desktop/dist/
 .cursor/
 .claude/
 .agents/
+
+# Local reference clones (e.g. pewbeam deep-dive source)
+.reference/
+
+# NDI SDK binaries (downloaded via `pnpm ndi:download`; proprietary Vizrt runtime)
+sdk/ndi/
+
+# Local scratch probes/reference captures — never committed (AGENTS.md)
+.scratch/

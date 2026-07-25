@@ -1,0 +1,13 @@
+# sherpa-rs (local speech engine) links its native libraries with @rpath
+# install names and copies the dylibs next to the built binaries
+# (target/{debug,release}). Without an executable-relative rpath the backend
+# aborts at launch with "Library not loaded: @rpath/libonnxruntime…dylib".
+[target.aarch64-apple-darwin]
+rustflags = ["-C", "link-args=-Wl,-rpath,@executable_path"]
+
+[target.x86_64-apple-darwin]
+rustflags = ["-C", "link-args=-Wl,-rpath,@executable_path"]
+
+# Same story on Linux: sherpa .so files sit next to the executable.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", 'link-args=-Wl,-rpath,$ORIGIN']

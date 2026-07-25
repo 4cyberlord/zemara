@@ -895,7 +895,10 @@ export function MembersTab(): ReactElement {
                   className="w-full"
                   value={form.locationId || 'none'}
                   onValueChange={(value) =>
-                    setForm((current) => ({ ...current, locationId: value === 'none' ? '' : value }))
+                    setForm((current) => ({
+                      ...current,
+                      locationId: value === 'none' ? '' : value
+                    }))
                   }
                   options={[
                     { value: 'none', label: 'No location set' },

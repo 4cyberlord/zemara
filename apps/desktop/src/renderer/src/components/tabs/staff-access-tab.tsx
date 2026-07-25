@@ -88,7 +88,9 @@ function InviteDialog({
         setRole('Read-only')
         onOpenChange(false)
       })
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not invite this person.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not invite this person.')
+      )
       .finally(() => setSaving(false))
   }
 
@@ -105,7 +107,12 @@ function InviteDialog({
         <FieldGroup>
           <Field>
             <FieldLabel htmlFor="staff-name">Name</FieldLabel>
-            <Input id="staff-name" value={name} onChange={(event) => setName(event.target.value)} autoFocus />
+            <Input
+              id="staff-name"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              autoFocus
+            />
           </Field>
           <Field>
             <FieldLabel htmlFor="staff-email">Email</FieldLabel>
@@ -154,7 +161,9 @@ function StaffRowActions({ user }: { user: TeamUser }): ReactElement {
   const handleRemove = (): void => {
     deleteTeamUser(user.id)
       .then(() => toast.success(`Removed ${user.name}.`))
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not remove this person.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not remove this person.')
+      )
   }
 
   return (

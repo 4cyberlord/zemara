@@ -38,11 +38,26 @@ extraResources:
 
 mac:
   category: public.app-category.video
+  # Sign local packages with the developer's real identity instead of adhoc.
+  # Adhoc-signed builds change cdhash every build, so macOS TCC grants (Screen
+  # Recording, camera, microphone) never stick between rebuilds. A stable
+  # identity keeps the grant attached to the app.
+  identity: "Apple Development: Charles Adu Boakye (7PK8WR8X78)"
   extraResources:
     - from: ../../target/release/videorc-backend
       to: videorc-backend
       filter:
         - videorc-backend
+    # sherpa-onnx local speech engine: the backend links these with @rpath
+    # (rpath = @executable_path), so they must sit next to videorc-backend in
+    # the packaged app's Resources dir. electron-builder signs them with the
+    # rest of extraResources.
+    - from: ../../target/release
+      to: ./
+      filter:
+        - libonnxruntime*.dylib
+        - libsherpa-onnx-c-api.dylib
+        - libsherpa-onnx-cxx-api.dylib
     - from: ../../target/release/native_preview_host_helper
       to: native_preview_host_helper
       filter:
@@ -106,6 +121,14 @@ win:
     # exe in target/release/, not target/<triple>/release/.
     - from: ../../target/release/videorc-backend.exe
       to: videorc-backend.exe
+    # sherpa-onnx local speech engine DLLs — Windows resolves them from the
+    # exe's directory, so they bundle next to videorc-backend.exe.
+    - from: ../../target/release
+      to: ./
+      filter:
+        - onnxruntime.dll
+        - sherpa-onnx-c-api.dll
+        - sherpa-onnx-cxx-api.dll
     - from: ../../vendor/ffmpeg/windows-x64
       to: ffmpeg
       filter:

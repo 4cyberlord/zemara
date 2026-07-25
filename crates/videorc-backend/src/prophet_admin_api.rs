@@ -51,7 +51,14 @@ pub fn get_connection() -> Result<AdminConnection> {
 }
 
 fn tail_hint(secret: &str) -> String {
-    let tail: String = secret.chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    let tail: String = secret
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("…{tail}")
 }
 
@@ -98,7 +105,12 @@ pub struct ConnectionTestResult {
 
 impl ConnectionTestResult {
     fn failure(message: impl Into<String>) -> Self {
-        Self { reachable: false, database_ok: false, auth_ok: false, message: message.into() }
+        Self {
+            reachable: false,
+            database_ok: false,
+            auth_ok: false,
+            message: message.into(),
+        }
     }
 }
 
@@ -131,7 +143,9 @@ pub async fn test_connection(base_url: &str, api_key: &str) -> ConnectionTestRes
     let url = format!("{base_url}/api/health");
     let response = match http.get(&url).bearer_auth(api_key.trim()).send().await {
         Ok(response) => response,
-        Err(error) => return ConnectionTestResult::failure(format!("Could not reach {url}: {error}")),
+        Err(error) => {
+            return ConnectionTestResult::failure(format!("Could not reach {url}: {error}"));
+        }
     };
     let status = response.status();
 
@@ -146,7 +160,12 @@ pub async fn test_connection(base_url: &str, api_key: &str) -> ConnectionTestRes
             } else {
                 "Connected.".to_string()
             };
-            ConnectionTestResult { reachable: true, database_ok, auth_ok, message }
+            ConnectionTestResult {
+                reachable: true,
+                database_ok,
+                auth_ok,
+                message,
+            }
         }
         Err(_) => ConnectionTestResult::failure(format!(
             "Unexpected response from {url} ({status}). Is this the right base URL?"
@@ -195,7 +214,12 @@ pub async fn register_organization(
 
     let http = build_http_client(REQUEST_TIMEOUT)?;
     let url = format!("{base_url}/api/register");
-    let body = RegisterRequestBody { organization_name, owner_name, owner_email, owner_password };
+    let body = RegisterRequestBody {
+        organization_name,
+        owner_name,
+        owner_email,
+        owner_password,
+    };
     let response = http
         .post(&url)
         .json(&body)
@@ -211,7 +235,11 @@ pub async fn register_organization(
     let envelope: ApiEnvelope<RegisterResult> = serde_json::from_str(&text)
         .with_context(|| format!("Could not parse the response from {url} ({status})."))?;
     if !envelope.ok {
-        bail!(envelope.error.unwrap_or_else(|| format!("Registration failed ({status}).")));
+        bail!(
+            envelope
+                .error
+                .unwrap_or_else(|| format!("Registration failed ({status})."))
+        );
     }
     envelope
         .data
@@ -224,6 +252,161 @@ fn build_http_client(timeout: std::time::Duration) -> Result<reqwest::Client> {
         .timeout(timeout)
         .build()
         .context("Could not build the admin API HTTP client.")
+}
+
+// ---------------------------------------------------------------------------
+// Staff session auth (the desktop sign-in gate)
+// ---------------------------------------------------------------------------
+//
+// Separate from the `rk_` API key: the key is the machine credential the data
+// plane uses, while a staff session identifies WHO is sitting at this desk.
+// Signing in stores the session token plus a cached identity snapshot (user
+// + organization) in the secrets file; signing out revokes the session on
+// the admin backend (best effort) and clears both.
+
+const SESSION_TOKEN_SECRET: &str = "prophet-admin:session-token";
+const IDENTITY_SECRET: &str = "prophet-admin:identity";
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminIdentityUser {
+    pub id: String,
+    pub name: String,
+    pub email: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminIdentityOrganization {
+    pub id: String,
+    pub name: String,
+    pub slug: String,
+}
+
+/// Who is signed in on this machine, and which church they belong to.
+/// Persisted in the secrets file so the sign-in gate can be skipped on the
+/// next launch without a network round-trip.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminIdentity {
+    pub user: AdminIdentityUser,
+    pub organization: AdminIdentityOrganization,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminLoginData {
+    user: AdminIdentityUser,
+    organization: AdminIdentityOrganization,
+    token: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AdminLoginBody<'a> {
+    email: &'a str,
+    password: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization: Option<&'a str>,
+}
+
+/// Signs a church staff member in against `/api/admin/auth/login`. The base
+/// URL argument wins when provided (the gate may run before Settings >
+/// Database is configured); otherwise the stored connection URL is used, and
+/// a successful sign-in also saves the URL so the rest of the app can find
+/// the backend. The session token and identity snapshot are stored only
+/// after the backend confirms the credentials.
+pub async fn login_admin(
+    base_url: Option<&str>,
+    email: &str,
+    password: &str,
+    organization: Option<&str>,
+) -> Result<AdminIdentity> {
+    let stored_url = try_get_secret(BASE_URL_SECRET)?;
+    let base_url = base_url
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(|url| url.trim_end_matches('/').to_string())
+        .or(stored_url)
+        .ok_or_else(|| anyhow::anyhow!("Enter the admin API base URL first."))?;
+    let email = email.trim();
+    if email.is_empty() || password.is_empty() {
+        bail!("Email and password are required.");
+    }
+
+    let http = build_http_client(REQUEST_TIMEOUT)?;
+    let url = format!("{base_url}/api/admin/auth/login");
+    let body = AdminLoginBody {
+        email,
+        password,
+        organization: organization.map(str::trim).filter(|org| !org.is_empty()),
+    };
+    let response = http
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("Could not reach {url}."))?;
+
+    let status = response.status();
+    let text = response
+        .text()
+        .await
+        .with_context(|| format!("Could not read the response from {url}."))?;
+    let envelope: ApiEnvelope<AdminLoginData> = serde_json::from_str(&text)
+        .with_context(|| format!("Could not parse the response from {url} ({status})."))?;
+    if !envelope.ok {
+        bail!(
+            envelope
+                .error
+                .unwrap_or_else(|| format!("Sign-in failed ({status})."))
+        );
+    }
+    let data = envelope
+        .data
+        .ok_or_else(|| anyhow::anyhow!("Sign-in response had no data."))?;
+
+    let identity = AdminIdentity {
+        user: data.user,
+        organization: data.organization,
+    };
+    let snapshot =
+        serde_json::to_string(&identity).context("Could not serialize the signed-in identity.")?;
+    put_secrets(&[
+        (BASE_URL_SECRET, base_url.as_str()),
+        (SESSION_TOKEN_SECRET, data.token.as_str()),
+        (IDENTITY_SECRET, snapshot.as_str()),
+    ])?;
+    Ok(identity)
+}
+
+/// The cached signed-in identity, or None when signed out. Both the token
+/// and the snapshot must be present — a half-written pair counts as signed
+/// out so the gate asks again instead of trusting a broken state.
+pub fn get_auth_identity() -> Result<Option<AdminIdentity>> {
+    let token = try_get_secret(SESSION_TOKEN_SECRET)?;
+    let snapshot = try_get_secret(IDENTITY_SECRET)?;
+    match (token, snapshot) {
+        (Some(_), Some(snapshot)) => Ok(Some(
+            serde_json::from_str(&snapshot).context("Stored identity snapshot is corrupt.")?,
+        )),
+        _ => Ok(None),
+    }
+}
+
+/// Revokes the staff session on the admin backend (best effort — a dead
+/// backend must not trap anyone in the gate) and clears the local pair.
+pub async fn logout_admin() -> Result<()> {
+    let base_url = try_get_secret(BASE_URL_SECRET)?;
+    let token = try_get_secret(SESSION_TOKEN_SECRET)?;
+    if let (Some(base_url), Some(token)) = (base_url, token)
+        && let Ok(http) = build_http_client(TEST_CONNECTION_TIMEOUT)
+    {
+        let url = format!("{}/api/admin/auth/logout", base_url.trim_end_matches('/'));
+        let _ = http.post(&url).bearer_auth(token).send().await;
+    }
+    delete_secrets(&[SESSION_TOKEN_SECRET, IDENTITY_SECRET])
 }
 
 // ---------------------------------------------------------------------------
@@ -299,7 +482,11 @@ pub struct AdminSermon {
 
 impl AdminSermon {
     fn finish_deserialize(mut self) -> Self {
-        self.topics = self.topic_links.iter().map(|link| link.topic.name.clone()).collect();
+        self.topics = self
+            .topic_links
+            .iter()
+            .map(|link| link.topic.name.clone())
+            .collect();
         self
     }
 }
@@ -309,7 +496,9 @@ impl<'de> serde::Deserialize<'de> for SermonWithFlattenedTopics {
     where
         D: serde::Deserializer<'de>,
     {
-        Ok(SermonWithFlattenedTopics(AdminSermon::deserialize(deserializer)?.finish_deserialize()))
+        Ok(SermonWithFlattenedTopics(
+            AdminSermon::deserialize(deserializer)?.finish_deserialize(),
+        ))
     }
 }
 
@@ -1312,8 +1501,10 @@ pub async fn geocode_search(query: &str) -> Result<Vec<GeocodeResult>> {
     if !response.status().is_success() {
         bail!("Location search failed ({}).", response.status());
     }
-    let results: Vec<NominatimResult> =
-        response.json().await.context("Location search returned an unexpected response.")?;
+    let results: Vec<NominatimResult> = response
+        .json()
+        .await
+        .context("Location search returned an unexpected response.")?;
     Ok(results
         .into_iter()
         .filter_map(|entry| {
@@ -1407,8 +1598,10 @@ pub async fn geocode_reverse(lat: f64, lng: f64) -> Result<GeocodeReverseResult>
     if !response.status().is_success() {
         bail!("Reverse geocoding failed ({}).", response.status());
     }
-    let result: PhotonReverseResponse =
-        response.json().await.context("Reverse geocoding returned an unexpected response.")?;
+    let result: PhotonReverseResponse = response
+        .json()
+        .await
+        .context("Reverse geocoding returned an unexpected response.")?;
     let label = result
         .features
         .first()
@@ -1501,7 +1694,11 @@ impl ProphetAdminApiClient {
         Self::unwrap_data(response, path).await
     }
 
-    async fn get_with_query<T: DeserializeOwned>(&self, path: &str, params: &[(&str, String)]) -> Result<T> {
+    async fn get_with_query<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> Result<T> {
         let response = self
             .http
             .get(self.endpoint(path))
@@ -1513,7 +1710,11 @@ impl ProphetAdminApiClient {
         Self::unwrap_data(response, path).await
     }
 
-    async fn post_json<T: DeserializeOwned, B: Serialize + ?Sized>(&self, path: &str, body: &B) -> Result<T> {
+    async fn post_json<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
         let response = self
             .http
             .post(self.endpoint(path))
@@ -1536,7 +1737,11 @@ impl ProphetAdminApiClient {
         Self::unwrap_data(response, path).await
     }
 
-    async fn patch_json<T: DeserializeOwned, B: Serialize + ?Sized>(&self, path: &str, body: &B) -> Result<T> {
+    async fn patch_json<T: DeserializeOwned, B: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &B,
+    ) -> Result<T> {
         let response = self
             .http
             .patch(self.endpoint(path))
@@ -1559,7 +1764,10 @@ impl ProphetAdminApiClient {
         Self::check_ok(response, path).await
     }
 
-    async fn unwrap_data<T: DeserializeOwned>(response: reqwest::Response, path: &str) -> Result<T> {
+    async fn unwrap_data<T: DeserializeOwned>(
+        response: reqwest::Response,
+        path: &str,
+    ) -> Result<T> {
         let status = response.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
             bail!("The admin API rejected this API key. Check Settings > Database.");
@@ -1571,7 +1779,11 @@ impl ProphetAdminApiClient {
         let envelope: ApiEnvelope<T> = serde_json::from_str(&text)
             .with_context(|| format!("Could not parse the admin API response for {path}."))?;
         if !envelope.ok {
-            bail!(envelope.error.unwrap_or_else(|| format!("Admin API request to {path} failed ({status}).")));
+            bail!(
+                envelope
+                    .error
+                    .unwrap_or_else(|| format!("Admin API request to {path} failed ({status})."))
+            );
         }
         envelope
             .data
@@ -1590,7 +1802,11 @@ impl ProphetAdminApiClient {
         let envelope: ApiEnvelope<serde_json::Value> = serde_json::from_str(&text)
             .with_context(|| format!("Could not parse the admin API response for {path}."))?;
         if !envelope.ok {
-            bail!(envelope.error.unwrap_or_else(|| format!("Admin API request to {path} failed ({status}).")));
+            bail!(
+                envelope
+                    .error
+                    .unwrap_or_else(|| format!("Admin API request to {path} failed ({status})."))
+            );
         }
         Ok(())
     }
@@ -1605,9 +1821,14 @@ impl ProphetAdminApiClient {
         Ok(raw.0)
     }
 
-    pub async fn update_sermon(&self, id: &str, request: &UpdateSermonRequest) -> Result<AdminSermon> {
-        let raw: SermonWithFlattenedTopics =
-            self.patch_json(&format!("/api/admin/sermons/{id}"), request).await?;
+    pub async fn update_sermon(
+        &self,
+        id: &str,
+        request: &UpdateSermonRequest,
+    ) -> Result<AdminSermon> {
+        let raw: SermonWithFlattenedTopics = self
+            .patch_json(&format!("/api/admin/sermons/{id}"), request)
+            .await?;
         Ok(raw.0)
     }
 
@@ -1634,8 +1855,9 @@ impl ProphetAdminApiClient {
     }
 
     pub async fn update_video(&self, id: &str, request: &UpdateVideoRequest) -> Result<AdminVideo> {
-        let raw: VideoWithFlattenedCategory =
-            self.patch_json(&format!("/api/admin/videos/{id}"), request).await?;
+        let raw: VideoWithFlattenedCategory = self
+            .patch_json(&format!("/api/admin/videos/{id}"), request)
+            .await?;
         Ok(raw.0)
     }
 
@@ -1677,7 +1899,11 @@ impl ProphetAdminApiClient {
         let parsed: FeatureToggleResponse = serde_json::from_str(&text)
             .with_context(|| format!("Could not parse the admin API response for {path}."))?;
         if !parsed.ok {
-            bail!(parsed.error.unwrap_or_else(|| format!("Admin API request to {path} failed ({status}).")));
+            bail!(
+                parsed
+                    .error
+                    .unwrap_or_else(|| format!("Admin API request to {path} failed ({status})."))
+            );
         }
         Ok(parsed.is_featured == Some(1))
     }
@@ -1690,7 +1916,8 @@ impl ProphetAdminApiClient {
         &self,
         request: &CreateVideoCategoryRequest,
     ) -> Result<VideoCategory> {
-        self.post_json("/api/admin/videos/categories", request).await
+        self.post_json("/api/admin/videos/categories", request)
+            .await
     }
 
     pub async fn list_members(
@@ -1701,8 +1928,10 @@ impl ProphetAdminApiClient {
         page: u32,
         page_size: u32,
     ) -> Result<MembersPage> {
-        let mut params: Vec<(&str, String)> =
-            vec![("page", page.to_string()), ("pageSize", page_size.to_string())];
+        let mut params: Vec<(&str, String)> = vec![
+            ("page", page.to_string()),
+            ("pageSize", page_size.to_string()),
+        ];
         if let Some(query) = query.map(str::trim).filter(|value| !value.is_empty()) {
             params.push(("q", query.to_string()));
         }
@@ -1719,8 +1948,13 @@ impl ProphetAdminApiClient {
         self.post_json("/api/admin/members", request).await
     }
 
-    pub async fn update_member(&self, id: &str, request: &UpdateMemberRequest) -> Result<AdminMember> {
-        self.patch_json(&format!("/api/admin/members/{id}"), request).await
+    pub async fn update_member(
+        &self,
+        id: &str,
+        request: &UpdateMemberRequest,
+    ) -> Result<AdminMember> {
+        self.patch_json(&format!("/api/admin/members/{id}"), request)
+            .await
     }
 
     pub async fn delete_member(&self, id: &str) -> Result<()> {
@@ -1731,7 +1965,10 @@ impl ProphetAdminApiClient {
         self.get("/api/notifications").await
     }
 
-    pub async fn create_campaign(&self, request: &CreateCampaignRequest) -> Result<NotificationCampaign> {
+    pub async fn create_campaign(
+        &self,
+        request: &CreateCampaignRequest,
+    ) -> Result<NotificationCampaign> {
         self.post_json("/api/notifications", request).await
     }
 
@@ -1740,7 +1977,8 @@ impl ProphetAdminApiClient {
         id: &str,
         request: &UpdateCampaignRequest,
     ) -> Result<NotificationCampaign> {
-        self.patch_json(&format!("/api/notifications/{id}"), request).await
+        self.patch_json(&format!("/api/notifications/{id}"), request)
+            .await
     }
 
     pub async fn delete_campaign(&self, id: &str) -> Result<()> {
@@ -1748,16 +1986,22 @@ impl ProphetAdminApiClient {
     }
 
     pub async fn send_campaign_now(&self, id: &str) -> Result<NotificationCampaign> {
-        self.post_no_body(&format!("/api/notifications/{id}/send")).await
+        self.post_no_body(&format!("/api/notifications/{id}/send"))
+            .await
     }
 
     pub async fn search_youtube(&self, query: &str) -> Result<Vec<YoutubeSearchResult>> {
-        self.get_with_query("/api/videos/youtube-search", &[("q", query.to_string())]).await
+        self.get_with_query("/api/videos/youtube-search", &[("q", query.to_string())])
+            .await
     }
 
-    pub async fn import_from_youtube(&self, request: &YoutubeImportRequest) -> Result<Vec<AdminVideo>> {
-        let raw: Vec<VideoWithFlattenedCategory> =
-            self.post_json("/api/videos/youtube-import", request).await?;
+    pub async fn import_from_youtube(
+        &self,
+        request: &YoutubeImportRequest,
+    ) -> Result<Vec<AdminVideo>> {
+        let raw: Vec<VideoWithFlattenedCategory> = self
+            .post_json("/api/videos/youtube-import", request)
+            .await?;
         Ok(raw.into_iter().map(|entry| entry.0).collect())
     }
 
@@ -1770,7 +2014,8 @@ impl ProphetAdminApiClient {
     }
 
     pub async fn update_event(&self, id: &str, request: &UpdateEventRequest) -> Result<AdminEvent> {
-        self.patch_json(&format!("/api/admin/events/{id}"), request).await
+        self.patch_json(&format!("/api/admin/events/{id}"), request)
+            .await
     }
 
     pub async fn delete_event(&self, id: &str) -> Result<()> {
@@ -1778,19 +2023,23 @@ impl ProphetAdminApiClient {
     }
 
     pub async fn open_attendance(&self, event_id: &str) -> Result<AttendanceSession> {
-        self.post_no_body(&format!("/api/admin/events/{event_id}/attendance/open")).await
+        self.post_no_body(&format!("/api/admin/events/{event_id}/attendance/open"))
+            .await
     }
 
     pub async fn close_attendance(&self, event_id: &str) -> Result<AttendanceSession> {
-        self.post_no_body(&format!("/api/admin/events/{event_id}/attendance/close")).await
+        self.post_no_body(&format!("/api/admin/events/{event_id}/attendance/close"))
+            .await
     }
 
     pub async fn get_attendance_qr(&self, event_id: &str) -> Result<AttendanceQr> {
-        self.get(&format!("/api/admin/events/{event_id}/attendance/qr")).await
+        self.get(&format!("/api/admin/events/{event_id}/attendance/qr"))
+            .await
     }
 
     pub async fn list_attendance(&self, event_id: &str) -> Result<AttendanceList> {
-        self.get(&format!("/api/admin/events/{event_id}/attendance")).await
+        self.get(&format!("/api/admin/events/{event_id}/attendance"))
+            .await
     }
 
     pub async fn manual_check_in(
@@ -1798,11 +2047,18 @@ impl ProphetAdminApiClient {
         event_id: &str,
         request: &ManualCheckInRequest,
     ) -> Result<AttendanceRecord> {
-        self.post_json(&format!("/api/admin/events/{event_id}/attendance/manual"), request).await
+        self.post_json(
+            &format!("/api/admin/events/{event_id}/attendance/manual"),
+            request,
+        )
+        .await
     }
 
     pub async fn delete_attendance_record(&self, event_id: &str, record_id: &str) -> Result<()> {
-        self.delete_ok(&format!("/api/admin/events/{event_id}/attendance/{record_id}")).await
+        self.delete_ok(&format!(
+            "/api/admin/events/{event_id}/attendance/{record_id}"
+        ))
+        .await
     }
 
     pub async fn list_units(&self) -> Result<Vec<OrganizationalUnit>> {
@@ -1817,20 +2073,33 @@ impl ProphetAdminApiClient {
         self.post_json("/api/admin/units", request).await
     }
 
-    pub async fn update_unit(&self, id: &str, request: &UpdateUnitRequest) -> Result<OrganizationalUnit> {
-        self.patch_json(&format!("/api/admin/units/{id}"), request).await
+    pub async fn update_unit(
+        &self,
+        id: &str,
+        request: &UpdateUnitRequest,
+    ) -> Result<OrganizationalUnit> {
+        self.patch_json(&format!("/api/admin/units/{id}"), request)
+            .await
     }
 
     pub async fn delete_unit(&self, id: &str) -> Result<()> {
         self.delete_ok(&format!("/api/admin/units/{id}")).await
     }
 
-    pub async fn add_unit_member(&self, unit_id: &str, request: &AddUnitMemberRequest) -> Result<OrganizationalUnitMembership> {
-        self.post_json(&format!("/api/admin/units/{unit_id}/members"), request).await
+    pub async fn add_unit_member(
+        &self,
+        unit_id: &str,
+        request: &AddUnitMemberRequest,
+    ) -> Result<OrganizationalUnitMembership> {
+        self.post_json(&format!("/api/admin/units/{unit_id}/members"), request)
+            .await
     }
 
     pub async fn remove_unit_member(&self, unit_id: &str, membership_id: &str) -> Result<()> {
-        self.delete_ok(&format!("/api/admin/units/{unit_id}/members/{membership_id}")).await
+        self.delete_ok(&format!(
+            "/api/admin/units/{unit_id}/members/{membership_id}"
+        ))
+        .await
     }
 
     pub async fn create_unit_position(
@@ -1838,11 +2107,15 @@ impl ProphetAdminApiClient {
         unit_id: &str,
         request: &CreateUnitPositionRequest,
     ) -> Result<OrganizationalUnitPosition> {
-        self.post_json(&format!("/api/admin/units/{unit_id}/positions"), request).await
+        self.post_json(&format!("/api/admin/units/{unit_id}/positions"), request)
+            .await
     }
 
     pub async fn delete_unit_position(&self, unit_id: &str, position_id: &str) -> Result<()> {
-        self.delete_ok(&format!("/api/admin/units/{unit_id}/positions/{position_id}")).await
+        self.delete_ok(&format!(
+            "/api/admin/units/{unit_id}/positions/{position_id}"
+        ))
+        .await
     }
 
     pub async fn assign_unit_position(
@@ -1851,7 +2124,11 @@ impl ProphetAdminApiClient {
         position_id: &str,
         request: &AssignUnitPositionRequest,
     ) -> Result<OrganizationalUnitPositionAssignment> {
-        self.post_json(&format!("/api/admin/units/{unit_id}/positions/{position_id}/assignments"), request).await
+        self.post_json(
+            &format!("/api/admin/units/{unit_id}/positions/{position_id}/assignments"),
+            request,
+        )
+        .await
     }
 
     pub async fn end_unit_position_assignment(
@@ -1874,8 +2151,13 @@ impl ProphetAdminApiClient {
         self.post_json("/api/admin/locations", request).await
     }
 
-    pub async fn update_location(&self, id: &str, request: &UpdateLocationRequest) -> Result<Location> {
-        self.patch_json(&format!("/api/admin/locations/{id}"), request).await
+    pub async fn update_location(
+        &self,
+        id: &str,
+        request: &UpdateLocationRequest,
+    ) -> Result<Location> {
+        self.patch_json(&format!("/api/admin/locations/{id}"), request)
+            .await
     }
 
     pub async fn delete_location(&self, id: &str) -> Result<()> {
@@ -1890,8 +2172,13 @@ impl ProphetAdminApiClient {
         self.post_json("/api/admin/team", request).await
     }
 
-    pub async fn update_team_user(&self, id: &str, request: &UpdateTeamUserRequest) -> Result<TeamUser> {
-        self.patch_json(&format!("/api/admin/team/{id}"), request).await
+    pub async fn update_team_user(
+        &self,
+        id: &str,
+        request: &UpdateTeamUserRequest,
+    ) -> Result<TeamUser> {
+        self.patch_json(&format!("/api/admin/team/{id}"), request)
+            .await
     }
 
     pub async fn delete_team_user(&self, id: &str) -> Result<()> {
@@ -1913,7 +2200,9 @@ impl ProphetAdminApiClient {
             .file_name(file_name.to_string())
             .mime_str(mime_type)
             .with_context(|| format!("\"{mime_type}\" is not a valid image type."))?;
-        let form = reqwest::multipart::Form::new().text("folder", folder.to_string()).part("file", part);
+        let form = reqwest::multipart::Form::new()
+            .text("folder", folder.to_string())
+            .part("file", part);
 
         let response = self
             .http
@@ -1928,11 +2217,19 @@ impl ProphetAdminApiClient {
         if status == reqwest::StatusCode::UNAUTHORIZED {
             bail!("The admin API rejected this API key. Check Settings > Database.");
         }
-        let text = response.text().await.context("Could not read the image upload response.")?;
-        let parsed: UploadImageResponse = serde_json::from_str(&text)
-            .with_context(|| format!("The admin API returned an unexpected image upload response: {text}"))?;
+        let text = response
+            .text()
+            .await
+            .context("Could not read the image upload response.")?;
+        let parsed: UploadImageResponse = serde_json::from_str(&text).with_context(|| {
+            format!("The admin API returned an unexpected image upload response: {text}")
+        })?;
         if !parsed.ok || parsed.url.is_none() {
-            bail!(parsed.error.unwrap_or_else(|| format!("Image upload failed ({status}).")));
+            bail!(
+                parsed
+                    .error
+                    .unwrap_or_else(|| format!("Image upload failed ({status})."))
+            );
         }
         Ok(UploadedImage {
             url: parsed.url.unwrap_or_default(),
@@ -1952,8 +2249,14 @@ impl ProphetAdminApiClient {
         self.get("/api/admin/bible/translations").await
     }
 
-    pub async fn fetch_bible_verses(&self, translation_code: &str) -> Result<AdminBibleVerseExport> {
-        self.get(&format!("/api/admin/bible/translations/{translation_code}/verses")).await
+    pub async fn fetch_bible_verses(
+        &self,
+        translation_code: &str,
+    ) -> Result<AdminBibleVerseExport> {
+        self.get(&format!(
+            "/api/admin/bible/translations/{translation_code}/verses"
+        ))
+        .await
     }
 }
 
@@ -1976,7 +2279,10 @@ mod tests {
 
     #[test]
     fn tail_hint_shows_only_the_last_four_characters() {
-        assert_eq!(tail_hint("rk_2dgCsl0x6Sc3eBdnVkaMjtT9Q1Vppjz1B47Tgv8OkI0"), "…OkI0");
+        assert_eq!(
+            tail_hint("rk_2dgCsl0x6Sc3eBdnVkaMjtT9Q1Vppjz1B47Tgv8OkI0"),
+            "…OkI0"
+        );
         assert_eq!(tail_hint("ab"), "…ab");
     }
 
@@ -2005,7 +2311,10 @@ mod tests {
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["title"], "New title");
         assert_eq!(value["scripture"], "");
-        assert!(value.get("summary").is_none(), "unset fields must not be sent at all");
+        assert!(
+            value.get("summary").is_none(),
+            "unset fields must not be sent at all"
+        );
     }
 
     #[tokio::test]

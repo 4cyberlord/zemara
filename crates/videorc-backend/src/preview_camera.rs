@@ -1974,11 +1974,19 @@ mod macos {
             let _ = tx.send(granted.as_bool());
         });
         unsafe {
-            AVCaptureDevice::requestAccessForMediaType_completionHandler(video_media_type, &handler);
+            AVCaptureDevice::requestAccessForMediaType_completionHandler(
+                video_media_type,
+                &handler,
+            );
         }
         match rx.recv_timeout(MACOS_CAMERA_PREVIEW_STARTUP_TIMEOUT) {
-            Ok(granted) => tracing::info!(granted, "request_camera_access_and_wait: completion handler fired"),
-            Err(error) => tracing::warn!(%error, "request_camera_access_and_wait: timed out or channel closed without a result"),
+            Ok(granted) => tracing::info!(
+                granted,
+                "request_camera_access_and_wait: completion handler fired"
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "request_camera_access_and_wait: timed out or channel closed without a result")
+            }
         }
     }
 
@@ -1991,10 +1999,16 @@ mod macos {
         if permission == NativeCameraPermission::NotDetermined {
             request_camera_access_and_wait();
             permission = native_camera_permission();
-            tracing::info!(?permission, "start_session: camera permission after request");
+            tracing::info!(
+                ?permission,
+                "start_session: camera permission after request"
+            );
         }
         if permission != NativeCameraPermission::Authorized {
-            tracing::warn!(?permission, "start_session: camera not authorized, aborting");
+            tracing::warn!(
+                ?permission,
+                "start_session: camera not authorized, aborting"
+            );
             return Err(NativeCameraStartup::PermissionNeeded(
                 permission_message(permission).to_string(),
             ));

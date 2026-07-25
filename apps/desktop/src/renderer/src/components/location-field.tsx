@@ -101,7 +101,8 @@ export function LocationField({
       onCoordinatesChangeRef.current(nextLat, nextLng)
       moveMarkerTo(nextLat, nextLng)
       if (!addressRef.current.trim()) {
-        reverseGeocodeRef.current(nextLat, nextLng)
+        reverseGeocodeRef
+          .current(nextLat, nextLng)
           .then((result) => {
             if (result.label) onAddressChangeRef.current(result.label)
           })
@@ -285,10 +286,13 @@ export function LocationField({
       ) : null}
 
       <div className="space-y-1.5">
-        <div className="h-[280px] w-full overflow-hidden rounded-2xl border" ref={mapContainerRef} />
+        <div
+          className="h-[280px] w-full overflow-hidden rounded-2xl border"
+          ref={mapContainerRef}
+        />
         <p className="text-xs text-muted-foreground">
-          Click the map or drag the pin to set a location — the address fills in
-          automatically if left blank.
+          Click the map or drag the pin to set a location — the address fills in automatically if
+          left blank.
         </p>
       </div>
     </div>

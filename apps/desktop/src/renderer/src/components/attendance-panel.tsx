@@ -76,7 +76,9 @@ export function AttendancePanel({
     if (!open) return
     setLoading(true)
     refresh()
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not load attendance.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not load attendance.')
+      )
       .finally(() => setLoading(false))
     if (members.length === 0 && !membersLoading) void refreshMembers()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -132,7 +134,9 @@ export function AttendancePanel({
         toast.success('Attendance opened.')
         return refresh()
       })
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not open attendance.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not open attendance.')
+      )
       .finally(() => setBusy(false))
   }
 
@@ -143,7 +147,9 @@ export function AttendancePanel({
         setSession(updated)
         toast.success('Attendance closed.')
       })
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not close attendance.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not close attendance.')
+      )
       .finally(() => setBusy(false))
   }
 
@@ -152,7 +158,9 @@ export function AttendancePanel({
     manualQuery.trim().length >= 2
       ? members
           .filter((member) => !alreadyCheckedInIds.has(member.id))
-          .filter((member) => member.fullName.toLowerCase().includes(manualQuery.trim().toLowerCase()))
+          .filter((member) =>
+            member.fullName.toLowerCase().includes(manualQuery.trim().toLowerCase())
+          )
           .slice(0, 8)
       : []
 
@@ -172,14 +180,18 @@ export function AttendancePanel({
         setManualOpen(false)
         return refresh()
       })
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not mark attendance.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not mark attendance.')
+      )
       .finally(() => setBusy(false))
   }
 
   const handleRemove = (recordId: string): void => {
     void deleteAttendanceRecord(event.id, recordId)
       .then(() => refresh())
-      .catch((error: unknown) => toast.error(error instanceof Error ? error.message : 'Could not remove this record.'))
+      .catch((error: unknown) =>
+        toast.error(error instanceof Error ? error.message : 'Could not remove this record.')
+      )
   }
 
   return (
@@ -227,7 +239,6 @@ export function AttendancePanel({
             {session.status === 'open' ? (
               <div className="flex flex-col items-center gap-3 rounded-2xl border bg-card p-6">
                 {qrDataUrl ? (
-                  // eslint-disable-next-line @next/next/no-img-element
                   <img src={qrDataUrl} alt="Attendance QR code" className="size-64 rounded-xl" />
                 ) : (
                   <div className="flex size-64 items-center justify-center rounded-xl bg-muted text-sm text-muted-foreground">
@@ -259,7 +270,11 @@ export function AttendancePanel({
             <div className="flex flex-col gap-2">
               <div className="flex items-center justify-between">
                 <span className="text-sm font-semibold text-foreground">Checked in</span>
-                <Button size="sm" variant="ghost" onClick={() => setManualOpen((current) => !current)}>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => setManualOpen((current) => !current)}
+                >
                   <UserPlus className="size-4" />
                   Mark manually
                 </Button>
@@ -308,7 +323,11 @@ export function AttendancePanel({
                         onChange={(inputEvent) => setManualReason(inputEvent.target.value)}
                         rows={2}
                       />
-                      <Button size="sm" disabled={busy || !manualReason.trim()} onClick={handleManualMark}>
+                      <Button
+                        size="sm"
+                        disabled={busy || !manualReason.trim()}
+                        onClick={handleManualMark}
+                      >
                         <CheckCircle className="size-4" />
                         Mark {manualMember.fullName} present
                       </Button>
@@ -318,7 +337,9 @@ export function AttendancePanel({
               ) : null}
 
               {records.length === 0 ? (
-                <p className="py-6 text-center text-sm text-muted-foreground">No one has checked in yet.</p>
+                <p className="py-6 text-center text-sm text-muted-foreground">
+                  No one has checked in yet.
+                </p>
               ) : (
                 <div className="flex max-h-72 flex-col gap-1 overflow-y-auto">
                   {records.map((record) => (
@@ -336,7 +357,9 @@ export function AttendancePanel({
                         <p className="text-xs text-muted-foreground">
                           {formatTime(record.checkedInAt)}
                           {record.method === 'manual' ? ' · marked manually' : ' · QR scan'}
-                          {record.minutesLate && record.minutesLate > 0 ? ` · ${record.minutesLate}m late` : ''}
+                          {record.minutesLate && record.minutesLate > 0
+                            ? ` · ${record.minutesLate}m late`
+                            : ''}
                         </p>
                       </div>
                       <button
